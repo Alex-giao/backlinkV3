@@ -1,0 +1,422 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { buildRetryDecisionPlan, canRetry, isRetryExhausted, matchesTaskScope, parkExhaustedRetryableTask, shouldDeferHostReactivation, shouldReactivateRuntimeRetries, } from "./task-queue.js";
+function makeTask(overrides = {}) {
+    return {
+        id: "task-1",
+        target_url: "https://example.com/submit",
+        hostname: "example.com",
+        submission: {
+            promoted_profile: {
+                url: "https://exactstatement.com/",
+                hostname: "exactstatement.com",
+                name: "Exact Statement",
+                description: "desc",
+                category_hints: ["finance"],
+                source: "fallback",
+            },
+            confirm_submit: true,
+        },
+        status: "RETRYABLE",
+        created_at: "2026-04-08T00:00:00.000Z",
+        updated_at: "2026-04-08T00:00:00.000Z",
+        run_count: 2,
+        escalation_level: "scout",
+        takeover_attempts: 0,
+        phase_history: [],
+        latest_artifacts: ["artifact.json"],
+        notes: [],
+        ...overrides,
+    };
+}
+test("retryable task becomes exhausted after the automatic retry budget is used", () => {
+    const task = makeTask();
+    assert.equal(isRetryExhausted(task), true);
+    assert.equal(canRetry(task), false);
+});
+test("parking an exhausted retryable task moves unknown cases out of the active retry queue", () => {
+    const task = makeTask();
+    const parked = parkExhaustedRetryableTask(task);
+    assert.equal(parked, true);
+    assert.equal(task.status, "WAITING_RETRY_DECISION");
+    assert.equal(task.wait?.wait_reason_code, "AUTOMATIC_RETRY_EXHAUSTED");
+    assert.match(task.last_takeover_outcome ?? "", /Automatic retry budget exhausted/);
+    assert.equal(canRetry(task), false);
+});
+test("parking an exhausted retryable task promotes missing-input cases directly to WAITING_MISSING_INPUT", () => {
+    const task = makeTask({
+        wait: {
+            wait_reason_code: "REQUIRED_INPUT_MISSING",
+            resume_trigger: "Missing required fields: Phone Number.",
+            resolution_owner: "none",
+            resolution_mode: "terminal_audit",
+            evidence_ref: "artifact.json",
+        },
+    });
+    const parked = parkExhaustedRetryableTask(task);
+    assert.equal(parked, true);
+    assert.equal(task.status, "WAITING_MISSING_INPUT");
+    assert.equal(task.wait?.wait_reason_code, "REQUIRED_INPUT_MISSING");
+});
+test("parking an exhausted retryable task promotes manual-auth cases directly to WAITING_MANUAL_AUTH", () => {
+    const task = makeTask({
+        wait: {
+            wait_reason_code: "DIRECTORY_LOGIN_REQUIRED",
+            resume_trigger: "Directory requires unsupported authentication.",
+            resolution_owner: "none",
+            resolution_mode: "terminal_audit",
+            evidence_ref: "artifact.json",
+        },
+    });
+    const parked = parkExhaustedRetryableTask(task);
+    assert.equal(parked, true);
+    assert.equal(task.status, "WAITING_MANUAL_AUTH");
+    assert.equal(task.wait?.wait_reason_code, "DIRECTORY_LOGIN_REQUIRED");
+});
+test("parking an exhausted retryable task promotes email verification checkpoints to WAITING_EXTERNAL_EVENT", () => {
+    const task = makeTask({
+        wait: {
+            wait_reason_code: "EMAIL_VERIFICATION_PENDING",
+            resume_trigger: "Check your email to verify the listing.",
+            resolution_owner: "gog",
+            resolution_mode: "auto_resume",
+            evidence_ref: "artifact.json",
+        },
+    });
+    const parked = parkExhaustedRetryableTask(task);
+    assert.equal(parked, true);
+    assert.equal(task.status, "WAITING_EXTERNAL_EVENT");
+    assert.equal(task.wait?.wait_reason_code, "EMAIL_VERIFICATION_PENDING");
+});
+test("parking an exhausted retryable task promotes clear success signals to WAITING_SITE_RESPONSE", () => {
+    const task = makeTask({
+        wait: {
+            wait_reason_code: "SITE_RESPONSE_PENDING",
+            resume_trigger: "Thank you. Your submission is pending review.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "artifact.json",
+        },
+    });
+    const parked = parkExhaustedRetryableTask(task);
+    assert.equal(parked, true);
+    assert.equal(task.status, "WAITING_SITE_RESPONSE");
+    assert.equal(task.wait?.wait_reason_code, "SITE_RESPONSE_PENDING");
+});
+test("parking an exhausted retryable task promotes captcha skips directly to SKIPPED", () => {
+    const task = makeTask({
+        skip_reason_code: "captcha_or_human_verification_required",
+        last_takeover_outcome: "A CAPTCHA challenge blocks submission.",
+    });
+    const parked = parkExhaustedRetryableTask(task);
+    assert.equal(parked, true);
+    assert.equal(task.status, "SKIPPED");
+    assert.equal(task.skip_reason_code, "captcha_or_human_verification_required");
+});
+test("fresh retryable task remains eligible after backoff expires", () => {
+    const task = makeTask({
+        run_count: 1,
+        updated_at: "2026-04-08T00:00:00.000Z",
+    });
+    assert.equal(isRetryExhausted(task), false);
+    assert.equal(canRetry(task), true);
+});
+test("runtime retry pool can be reactivated when the health gate passes", () => {
+    assert.equal(shouldReactivateRuntimeRetries({ healthy: true, summary: "runtime ok" }), true);
+    assert.equal(shouldReactivateRuntimeRetries({ healthy: false, summary: "browser-use unhealthy" }), false);
+    assert.equal(shouldReactivateRuntimeRetries(undefined), false);
+});
+test("host-level reactivation guard defers hot hosts and duplicate host releases in the same apply tick", () => {
+    assert.equal(shouldDeferHostReactivation({
+        hostname: "example.com",
+        bucket: "reactivate_ready",
+        hotHosts: ["example.com"],
+        alreadyReleasedHosts: [],
+    }), true);
+    assert.equal(shouldDeferHostReactivation({
+        hostname: "example.com",
+        bucket: "runtime_reactivate_ready",
+        hotHosts: [],
+        alreadyReleasedHosts: ["example.com"],
+    }), true);
+    assert.equal(shouldDeferHostReactivation({
+        hostname: "example.com",
+        bucket: "terminal_manual_auth",
+        hotHosts: ["example.com"],
+        alreadyReleasedHosts: [],
+    }), false);
+});
+test("matchesTaskScope filters by task prefix and promoted profile fields", () => {
+    const task = makeTask({
+        id: "exactstatement-20260411-awesomefree-row-0066-promotebusinessdirectory-com",
+        submission: {
+            promoted_profile: {
+                url: "https://exactstatement.com/",
+                hostname: "exactstatement.com",
+                name: "Exact Statement",
+                description: "desc",
+                category_hints: ["finance"],
+                source: "fallback",
+            },
+            confirm_submit: true,
+        },
+    });
+    assert.equal(matchesTaskScope(task, { taskIdPrefix: "exactstatement-20260411-awesomefree-row-" }), true);
+    assert.equal(matchesTaskScope(task, { taskIdPrefix: "other-campaign-" }), false);
+    assert.equal(matchesTaskScope(task, { promotedHostname: "exactstatement.com" }), true);
+    assert.equal(matchesTaskScope(task, { promotedHostname: "other.com" }), false);
+    assert.equal(matchesTaskScope(task, { promotedUrl: "https://exactstatement.com/" }), true);
+    assert.equal(matchesTaskScope(task, { promotedUrl: "https://other.com/" }), false);
+});
+test("buildRetryDecisionPlan uses early terminal classifier success semantics to avoid manual triage", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+    const artifactPath = path.join(dir, "finalization.json");
+    await writeFile(artifactPath, JSON.stringify({
+        current_url: "https://directory.example.com/thanks",
+        title: "Thanks for submitting",
+        body_excerpt: "Thanks for submitting. Please verify your email to complete listing.",
+        early_terminal_classifier: {
+            hypothesis: "email_verification_pending_but_submitted",
+            recommended_state: "WAITING_EXTERNAL_EVENT",
+            recommended_business_outcome: "submitted_success",
+            allow_rerun: false,
+        },
+        final_outcome: {
+            next_status: "WAITING_RETRY_DECISION",
+            detail: "Legacy state before repartition.",
+        },
+    }), "utf-8");
+    const plan = await buildRetryDecisionPlan(makeTask({
+        status: "WAITING_RETRY_DECISION",
+        latest_artifacts: [artifactPath],
+    }));
+    assert.equal(plan.bucket, "external_email_verification");
+    assert.equal(plan.nextStatus, "WAITING_EXTERNAL_EVENT");
+    assert.equal(plan.waitReasonCode, "EMAIL_VERIFICATION_PENDING");
+});
+test("buildRetryDecisionPlan treats strong visual confirmation without failure signal as submitted success", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+    const artifactPath = path.join(dir, "finalization.json");
+    await writeFile(artifactPath, JSON.stringify({
+        current_url: "https://devpages.io/submit-a-tool",
+        title: "Submit a Tool | DevPages",
+        body_excerpt: "",
+        visual_verification: {
+            classification: "success_or_confirmation",
+            confidence: 0.97,
+            summary: "Thank You! Your tool submission has been received. No error message is visible.",
+        },
+        final_outcome: {
+            next_status: "RETRYABLE",
+            detail: "Legacy outcome_not_confirmed before visual-success override.",
+        },
+    }), "utf-8");
+    const plan = await buildRetryDecisionPlan(makeTask({
+        status: "WAITING_RETRY_DECISION",
+        latest_artifacts: [artifactPath],
+    }));
+    assert.equal(plan.bucket, "terminal_success");
+    assert.equal(plan.nextStatus, "WAITING_SITE_RESPONSE");
+    assert.equal(plan.waitReasonCode, "SITE_RESPONSE_PENDING");
+});
+test("buildRetryDecisionPlan does not apply directory success phrases to forum_profile tasks", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+    const artifactPath = path.join(dir, "finalization.json");
+    await writeFile(artifactPath, JSON.stringify({
+        current_url: "https://community.example.com/profile",
+        title: "Community Profile",
+        body_excerpt: "Thanks for submitting your startup.",
+        final_outcome: {
+            next_status: "WAITING_RETRY_DECISION",
+            detail: "Legacy state before repartition.",
+        },
+    }), "utf-8");
+    const plan = await buildRetryDecisionPlan(makeTask({
+        flow_family: "forum_profile",
+        status: "WAITING_RETRY_DECISION",
+        latest_artifacts: [artifactPath],
+        target_url: "https://community.example.com/profile",
+        hostname: "community.example.com",
+    }));
+    assert.notEqual(plan.bucket, "terminal_success");
+    assert.notEqual(plan.waitReasonCode, "SITE_RESPONSE_PENDING");
+});
+test("buildRetryDecisionPlan does not divert supported dev_blog families into generic community strategy parking", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+    const artifactPath = path.join(dir, "finalization.json");
+    await writeFile(artifactPath, JSON.stringify({
+        current_url: "https://dev.to/new",
+        title: "Write Post",
+        body_excerpt: "Draft saved for later editing.",
+        final_outcome: {
+            next_status: "RETRYABLE",
+            detail: "Draft saved for later editing.",
+            wait: {
+                wait_reason_code: "ARTICLE_DRAFT_SAVED",
+                resume_trigger: "Continue from the saved draft in a later automation pass.",
+                resolution_owner: "system",
+                resolution_mode: "auto_resume",
+                evidence_ref: artifactPath,
+            },
+        },
+    }), "utf-8");
+    const plan = await buildRetryDecisionPlan(makeTask({
+        flow_family: "dev_blog",
+        status: "WAITING_RETRY_DECISION",
+        latest_artifacts: [artifactPath],
+        target_url: "https://dev.to/new",
+        hostname: "dev.to",
+    }), { healthy: true, summary: "runtime ok" });
+    assert.notEqual(plan.bucket, "community_strategy");
+    assert.equal(plan.nextStatus, "READY");
+});
+test("buildRetryDecisionPlan does not treat visual confirmation alone as terminal success for wp_comment flows", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+    const artifactPath = path.join(dir, "finalization.json");
+    await writeFile(artifactPath, JSON.stringify({
+        current_url: "https://blog.example.com/post-1#comments",
+        title: "Comments",
+        body_excerpt: "Thanks! Your comment has been received.",
+        visual_verification: {
+            classification: "success_or_confirmation",
+            confidence: 0.97,
+            summary: "A thank-you banner confirms the comment submission form was accepted.",
+        },
+        final_outcome: {
+            next_status: "WAITING_RETRY_DECISION",
+            detail: "Legacy outcome awaiting repartition.",
+        },
+    }), "utf-8");
+    const plan = await buildRetryDecisionPlan(makeTask({
+        flow_family: "wp_comment",
+        status: "WAITING_RETRY_DECISION",
+        latest_artifacts: [artifactPath],
+        target_url: "https://blog.example.com/post-1#comments",
+        hostname: "blog.example.com",
+    }));
+    assert.notEqual(plan.bucket, "terminal_success");
+    assert.notEqual(plan.waitReasonCode, "SITE_RESPONSE_PENDING");
+});
+test("buildRetryDecisionPlan uses early terminal classifier policy blockers to avoid generic retry triage", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+    const artifactPath = path.join(dir, "finalization.json");
+    await writeFile(artifactPath, JSON.stringify({
+        current_url: "https://directory.example.com/add-site",
+        title: "Add your site",
+        body_excerpt: "Add our backlink first and share the live reciprocal backlink URL for review.",
+        early_terminal_classifier: {
+            hypothesis: "reciprocal_backlink_required",
+            recommended_state: "WAITING_POLICY_DECISION",
+            recommended_business_outcome: "blocked_policy",
+            allow_rerun: false,
+        },
+        final_outcome: {
+            next_status: "WAITING_RETRY_DECISION",
+            detail: "Legacy state before repartition.",
+        },
+    }), "utf-8");
+    const plan = await buildRetryDecisionPlan(makeTask({
+        status: "WAITING_RETRY_DECISION",
+        latest_artifacts: [artifactPath],
+    }));
+    assert.equal(plan.bucket, "terminal_policy");
+    assert.equal(plan.nextStatus, "WAITING_POLICY_DECISION");
+    assert.equal(plan.waitReasonCode, "RECIPROCAL_BACKLINK_REQUIRED");
+});
+test("buildRetryDecisionPlan ignores generic sponsor or pricing copy without a real paid-listing boundary", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+    const artifactPath = path.join(dir, "finalization.json");
+    await writeFile(artifactPath, JSON.stringify({
+        current_url: "https://directory.example.com/submit",
+        title: "Submit your tool",
+        body_excerpt: "Free submit is available. Sponsored by Stripe. Optional newsletter subscription for readers. Advertiser analytics starts at $49 per month.",
+        final_outcome: {
+            next_status: "WAITING_RETRY_DECISION",
+            detail: "Legacy state before repartition.",
+        },
+    }), "utf-8");
+    const plan = await buildRetryDecisionPlan(makeTask({
+        status: "WAITING_RETRY_DECISION",
+        latest_artifacts: [artifactPath],
+    }));
+    assert.notEqual(plan.bucket, "terminal_policy");
+    assert.notEqual(plan.waitReasonCode, "PAID_OR_SPONSORED_LISTING");
+});
+test("buildRetryDecisionPlan does not promote terminal success from unstructured thank-you copy alone", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+    const artifactPath = path.join(dir, "finalization.json");
+    await writeFile(artifactPath, JSON.stringify({
+        current_url: "https://directory.example.com/submit",
+        title: "Submit your tool",
+        body_excerpt: "Thanks for submitting. We love helping founders launch.",
+        final_outcome: {
+            next_status: "WAITING_RETRY_DECISION",
+            detail: "Legacy state before repartition.",
+        },
+    }), "utf-8");
+    const plan = await buildRetryDecisionPlan(makeTask({
+        status: "WAITING_RETRY_DECISION",
+        latest_artifacts: [artifactPath],
+    }));
+    assert.notEqual(plan.bucket, "terminal_success");
+    assert.notEqual(plan.waitReasonCode, "SITE_RESPONSE_PENDING");
+});
+test("parking an exhausted retryable task does not trust stale success notes without structured evidence", () => {
+    const task = makeTask({
+        wait: {
+            wait_reason_code: "AUTOMATIC_RETRY_EXHAUSTED",
+            resume_trigger: "Automatic retry budget exhausted.",
+            resolution_owner: "none",
+            resolution_mode: "terminal_audit",
+            evidence_ref: "artifact.json",
+        },
+        last_takeover_outcome: "Thanks for submitting. Your listing is under review.",
+        notes: ["Please check your email to verify the listing."],
+    });
+    const parked = parkExhaustedRetryableTask(task);
+    assert.equal(parked, true);
+    assert.equal(task.status, "WAITING_RETRY_DECISION");
+    assert.equal(task.wait?.wait_reason_code, "AUTOMATIC_RETRY_EXHAUSTED");
+});
+test("buildRetryDecisionPlan cools down repeated stale-path retries instead of reactivating immediately", async () => {
+    const plan = await buildRetryDecisionPlan(makeTask({
+        status: "WAITING_RETRY_DECISION",
+        run_count: 3,
+        wait: {
+            wait_reason_code: "AUTOMATIC_RETRY_EXHAUSTED",
+            resume_trigger: "Automatic retry budget exhausted.",
+            resolution_owner: "none",
+            resolution_mode: "terminal_audit",
+            evidence_ref: "artifact.json",
+        },
+        last_takeover_outcome: "Fresh probe confirmed this is still a stale submit path.",
+    }), { healthy: true, summary: "runtime ok" });
+    assert.equal(plan.bucket, "reactivation_cooldown");
+    assert.equal(plan.nextStatus, "WAITING_RETRY_DECISION");
+    assert.equal(plan.waitReasonCode, "REACTIVATION_COOLDOWN");
+    assert.match(plan.detail, /cooldown/i);
+});
+test("buildRetryDecisionPlan escalates repeated stale-path retries after cooldown has already been consumed", async () => {
+    const plan = await buildRetryDecisionPlan(makeTask({
+        status: "WAITING_RETRY_DECISION",
+        run_count: 4,
+        wait: {
+            wait_reason_code: "AUTOMATIC_RETRY_EXHAUSTED",
+            resume_trigger: "Automatic retry budget exhausted.",
+            resolution_owner: "none",
+            resolution_mode: "terminal_audit",
+            evidence_ref: "artifact.json",
+        },
+        last_takeover_outcome: "Fresh probe confirmed this is still a stale submit path.",
+        reactivation_cooldown_until: "2026-04-07T00:00:00.000Z",
+        reactivation_cooldown_reason: "STALE_SUBMIT_PATH",
+        reactivation_cooldown_count: 1,
+    }), { healthy: true, summary: "runtime ok" });
+    assert.equal(plan.bucket, "needs_manual_triage");
+    assert.equal(plan.nextStatus, "WAITING_RETRY_DECISION");
+    assert.equal(plan.waitReasonCode, "REPEATED_FAILURE_REVIEW_REQUIRED");
+    assert.match(plan.detail, /repeated/i);
+});

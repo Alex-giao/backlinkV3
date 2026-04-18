@@ -1,0 +1,15 @@
+# Runtime state and private local data
+assets/backlinkhelper/data/backlink-helper/
+
+# Dependencies
+assets/backlinkhelper/node_modules/
+
+# Common local noise
+.DS_Store
+*.log
+*.tmp
+
+# Optional local caches / reports
+assets/backlinkhelper/test-results/
+assets/backlinkhelper/playwright-report/
+assets/backlinkhelper/.cache/

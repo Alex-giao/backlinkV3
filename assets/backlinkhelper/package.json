@@ -1,0 +1,35 @@
+{
+  "name": "backliner-helper",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal executable backbone for shared-CDP backlink submission workflows.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "corepack pnpm build && node --test dist/**/*.test.js",
+    "start-browser": "corepack pnpm build && node dist/cli/index.js start-browser",
+    "preflight": "corepack pnpm build && node dist/cli/index.js preflight",
+    "ensure-openclaw-cron": "corepack pnpm build && node dist/cli/index.js ensure-openclaw-cron",
+    "enqueue-site": "corepack pnpm build && node dist/cli/index.js enqueue-site",
+    "guarded-drain-status": "corepack pnpm build && node dist/cli/index.js guarded-drain-status",
+    "mailbox-triage": "corepack pnpm build && node dist/cli/index.js mailbox-triage",
+    "missing-input-preflight": "corepack pnpm build && node dist/cli/index.js missing-input-preflight",
+    "claim-next-task": "corepack pnpm build && node dist/cli/index.js claim-next-task",
+    "task-prepare": "corepack pnpm build && node dist/cli/index.js task-prepare",
+    "task-record-agent-trace": "corepack pnpm build && node dist/cli/index.js task-record-agent-trace",
+    "task-finalize": "corepack pnpm build && node dist/cli/index.js task-finalize",
+    "run-next": "corepack pnpm build && node dist/cli/index.js run-next",
+    "repartition-retry-decisions": "corepack pnpm build && node dist/cli/index.js repartition-retry-decisions",
+    "drain-worker": "corepack pnpm build && node scripts/drain-worker.mjs",
+    "sync-skills": "node scripts/sync-skills.mjs",
+    "validate-skills": "node scripts/validate-skills.mjs",
+    "diff-skills": "node scripts/diff-skills.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.54.2"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.13",
+    "typescript": "^5.8.3"
+  }
+}

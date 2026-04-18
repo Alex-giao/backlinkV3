@@ -1,0 +1,6 @@
+interface:
+  display_name: "Web Backlinker V3 Operator"
+  short_description: "按薄 skill + 强 brief 方式运行单站点 bounded worker"
+  default_prompt: "Use $web-backlinker-v3-operator to run one bounded backlink submission task with strategy philosophy, minimal complete toolset, and necessary facts; let the natural-language brief define campaign goals and boundaries."
+policy:
+  allow_implicit_invocation: false
