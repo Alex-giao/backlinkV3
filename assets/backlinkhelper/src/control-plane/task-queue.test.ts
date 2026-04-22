@@ -193,6 +193,30 @@ test("pickNextTaskForLane exposes lightweight site-response checkpoints to the f
   assert.equal(pickNextTaskForLane([unsupportedWaiting, siteResponseWaiting], "follow_up")?.id, "site-response-waiting");
 });
 
+test("pickNextTaskForLane prioritizes higher queue_priority_score before FIFO among READY active tasks", () => {
+  const olderLowPriority = makeTask({
+    id: "older-low-priority",
+    status: "READY",
+    run_count: 0,
+    flow_family: "saas_directory",
+    created_at: "2026-04-08T00:00:00.000Z",
+    queue_priority_score: 15,
+  });
+  const newerHighPriority = makeTask({
+    id: "newer-high-priority",
+    status: "READY",
+    run_count: 0,
+    flow_family: "saas_directory",
+    created_at: "2026-04-08T00:00:05.000Z",
+    queue_priority_score: 80,
+  });
+
+  assert.equal(
+    pickNextTaskForLane([olderLowPriority, newerHighPriority], "directory_active")?.id,
+    "newer-high-priority",
+  );
+});
+
 test("resolveWorkerLeaseGroupForLane keeps active work serialized while follow-up work gets its own slot", () => {
   assert.equal(resolveWorkerLeaseGroupForLane("directory_active"), "active");
   assert.equal(resolveWorkerLeaseGroupForLane("non_directory_active"), "active");

@@ -1,5 +1,6 @@
 import { ensureDataDirectories, getArtifactFilePath, getPendingFinalizePath, loadTask, saveTask, writeJsonFile, } from "../memory/data-store.js";
 import { updateTaskExecutionStateFromTrace } from "../shared/task-progress.js";
+import { markTaskStageTimestamp } from "../shared/task-timing.js";
 export async function recordAgentTrace(args) {
     await ensureDataDirectories();
     if (args.envelope.trace.task_id !== args.taskId) {
@@ -20,6 +21,7 @@ export async function recordAgentTrace(args) {
         task.latest_artifacts.push(tracePath);
     }
     task.notes.push(`Recorded Codex-driven agent trace with ${args.envelope.trace.steps.length} step(s).`);
+    markTaskStageTimestamp(task, "trace_recorded_at");
     task.last_takeover_outcome = args.envelope.handoff.detail;
     updateTaskExecutionStateFromTrace({
         task,

@@ -19,6 +19,7 @@ import { resolveBrowserRuntime } from "../shared/browser-runtime.js";
 import { generateCredentialRef } from "../shared/email.js";
 import { runPreflight } from "../shared/preflight.js";
 import { updateTaskExecutionStateFromFinalize, updateTaskExecutionStateFromOutcome } from "../shared/task-progress.js";
+import { markTaskStageTimestamp } from "../shared/task-timing.js";
 import type {
   AccountDraft,
   BrowserRuntime,
@@ -105,6 +106,8 @@ export async function finalizeTask(args: {
     throw new Error(`Task ${args.taskId} does not have a pending finalization payload.`);
   }
 
+  markTaskStageTimestamp(task, "finalize_started_at");
+
   const runtime = await runPreflight(await resolveBrowserRuntime(args.cdpUrl));
   const preflightPath = getLatestPreflightPath();
   await writeJsonFile(preflightPath, runtime);
@@ -126,6 +129,7 @@ export async function finalizeTask(args: {
     };
 
     task.wait = retryResult.wait;
+    markTaskStageTimestamp(task, "finalize_finished_at");
     task.status = retryResult.next_status;
     task.updated_at = new Date().toISOString();
     task.terminal_class = retryResult.terminal_class;
@@ -173,6 +177,8 @@ export async function finalizeTask(args: {
       }
     }
   }
+
+  markTaskStageTimestamp(task, "finalize_finished_at");
 
   applyFinalizeResultToTask({
     task,

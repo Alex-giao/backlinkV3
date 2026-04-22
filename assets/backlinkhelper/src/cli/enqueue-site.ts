@@ -12,6 +12,6 @@ export async function runEnqueueSiteCommand(args: {
   flowFamily?: FlowFamily;
   enqueuedBy?: string;
 }): Promise<void> {
-  const task = await enqueueSiteTask(args);
-  console.log(JSON.stringify(task, null, 2));
+  const result = await enqueueSiteTask(args);
+  console.log(JSON.stringify(result, null, 2));
 }

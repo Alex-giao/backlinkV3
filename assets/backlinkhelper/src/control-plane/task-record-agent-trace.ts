@@ -7,6 +7,7 @@ import {
   writeJsonFile,
 } from "../memory/data-store.js";
 import { updateTaskExecutionStateFromTrace } from "../shared/task-progress.js";
+import { markTaskStageTimestamp } from "../shared/task-timing.js";
 import type { AgentTraceEnvelope } from "../shared/types.js";
 
 export async function recordAgentTrace(args: {
@@ -37,6 +38,7 @@ export async function recordAgentTrace(args: {
     task.latest_artifacts.push(tracePath);
   }
   task.notes.push(`Recorded Codex-driven agent trace with ${args.envelope.trace.steps.length} step(s).`);
+  markTaskStageTimestamp(task, "trace_recorded_at");
   task.last_takeover_outcome = args.envelope.handoff.detail;
   updateTaskExecutionStateFromTrace({
     task,

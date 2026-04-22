@@ -110,6 +110,48 @@ export type ClaimLane = TaskLane | "active_any";
 
 export type WorkerLeaseGroup = "active" | "follow_up";
 
+export type TargetPreflightViability = "promising" | "unclear" | "deprioritized";
+
+export type TargetPreflightSignalKind =
+  | "positive_submit_signal"
+  | "family_path_signal"
+  | "auth_surface_signal"
+  | "content_surface_signal"
+  | "commercial_barrier_signal"
+  | "historical_success_signal"
+  | "historical_fast_fail_signal"
+  | "historical_waiting_signal";
+
+export interface TargetPreflightSignal {
+  kind: TargetPreflightSignalKind;
+  detail: string;
+  score_delta: number;
+}
+
+export interface TargetPreflightAssessment {
+  version: number;
+  assessed_at: string;
+  promoted_hostname: string;
+  exact_target_hostname: string;
+  queue_priority_score: number;
+  viability: TargetPreflightViability;
+  historical_exact_host_hits: number;
+  historical_success_count: number;
+  historical_fast_fail_count: number;
+  historical_waiting_count: number;
+  signals: TargetPreflightSignal[];
+}
+
+export interface TaskStageTimestamps {
+  enqueued_at?: string;
+  claimed_at?: string;
+  prepare_started_at?: string;
+  prepare_finished_at?: string;
+  trace_recorded_at?: string;
+  finalize_started_at?: string;
+  finalize_finished_at?: string;
+}
+
 export type LinkRelFlag = "ugc" | "sponsored" | "nofollow";
 
 export type LinkVerificationStatus = "verified_link_present" | "link_hidden" | "link_missing";
@@ -340,6 +382,9 @@ export interface TaskRecord {
   recovered_target_url?: string;
   email_verification_continuation?: EmailVerificationContinuation;
   link_verification?: LinkVerificationResult;
+  target_preflight?: TargetPreflightAssessment;
+  queue_priority_score?: number;
+  stage_timestamps?: TaskStageTimestamps;
   execution_state?: TaskExecutionState;
   phase_history: string[];
   latest_artifacts: string[];

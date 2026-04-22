@@ -1,8 +1,10 @@
 import { loadOrCreatePromotedProfile } from "../shared/promoted-profile.js";
 import { getFamilyConfig, resolveFlowFamily } from "../families/index.js";
+import { buildTargetPreflightAssessment, findExactHostDuplicateTasks } from "./target-preflight.js";
 import { clearPendingFinalize, clearWorkerLease, ensureDataDirectories, listTasks, loadTask, loadWorkerLease, readJsonFile, saveTask, saveWorkerLease, } from "../memory/data-store.js";
 import { loadBrowserOwnership, reapExpiredBrowserOwnership } from "../execution/ownership-lock.js";
 import { BOUNDED_WORKER_LEASE_TTL_MS } from "../shared/runtime-budgets.js";
+import { markTaskStageTimestamp } from "../shared/task-timing.js";
 const RETRY_BACKOFF_MS = 60 * 60 * 1_000;
 const MAX_AUTOMATIC_RETRIES = 1;
 const RETRY_EXHAUSTED_WAIT_REASON_CODE = "AUTOMATIC_RETRY_EXHAUSTED";
@@ -128,10 +130,25 @@ function buildTask(args) {
         run_count: 0,
         escalation_level: "none",
         takeover_attempts: 0,
+        stage_timestamps: {
+            enqueued_at: now,
+        },
         phase_history: [],
         latest_artifacts: [],
         notes: [],
     };
+}
+function applyTargetPreflightToTask(args) {
+    const assessment = buildTargetPreflightAssessment({
+        targetUrl: args.task.target_url,
+        promotedHostname: args.task.submission.promoted_profile.hostname,
+        flowFamily: args.task.flow_family,
+        historicalTasks: args.historicalTasks,
+        excludeTaskId: args.task.id,
+        now: args.now,
+    });
+    args.task.target_preflight = assessment;
+    args.task.queue_priority_score = assessment.queue_priority_score;
 }
 function updateTaskStatus(task, status) {
     task.status = status;
@@ -139,6 +156,19 @@ function updateTaskStatus(task, status) {
 }
 function compareByCreatedAt(left, right) {
     return new Date(left.created_at).getTime() - new Date(right.created_at).getTime();
+}
+function getTaskQueuePriorityScore(task) {
+    return task.queue_priority_score ?? task.target_preflight?.queue_priority_score ?? 0;
+}
+function compareByQueuePriorityThenCreated(left, right) {
+    return getTaskQueuePriorityScore(right) - getTaskQueuePriorityScore(left) || compareByCreatedAt(left, right);
+}
+function prepareTaskForReenqueue(task) {
+    task.wait = undefined;
+    task.skip_reason_code = undefined;
+    task.terminal_class = undefined;
+    task.lease_expires_at = undefined;
+    task.email_verification_continuation = undefined;
 }
 export function matchesTaskScope(task, scope = {}) {
     if (scope.taskIdPrefix && !task.id.startsWith(scope.taskIdPrefix)) {
@@ -213,10 +243,10 @@ export function pickNextTaskForLane(tasks, lane = "active_any") {
     }
     const readyTasks = tasks
         .filter((task) => task.status === "READY" && matchesClaimLane(task, lane))
-        .sort(compareByCreatedAt);
+        .sort(compareByQueuePriorityThenCreated);
     const retryableTasks = tasks
         .filter((task) => canRetry(task) && matchesClaimLane(task, lane))
-        .sort(compareByCreatedAt);
+        .sort(compareByQueuePriorityThenCreated);
     return readyTasks[0] ?? retryableTasks[0];
 }
 export function buildTaskLaneReport(tasks) {
@@ -1028,51 +1058,136 @@ export async function enqueueSiteTask(args) {
         promotedName: args.promotedName,
         promotedDescription: args.promotedDescription,
     });
+    const now = new Date().toISOString();
+    const targetHostname = new URL(args.targetUrl).hostname;
+    const tasks = await listTasks();
     const existingTask = await loadTask(args.taskId);
     if (existingTask?.status === "RUNNING") {
         throw new Error(`Task ${args.taskId} is already RUNNING and cannot be re-enqueued.`);
     }
-    const task = existingTask
-        ? (() => {
-            const familyAudit = deriveFlowFamilyAudit({
-                existingTask,
-                requestedFlowFamily: args.flowFamily,
-                enqueuedBy: args.enqueuedBy,
-            });
-            return {
-                ...existingTask,
-                target_url: args.targetUrl,
-                hostname: new URL(args.targetUrl).hostname,
-                flow_family: familyAudit.flowFamily,
-                flow_family_source: familyAudit.flowFamilySource,
-                flow_family_reason: familyAudit.flowFamilyReason,
-                flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
-                corrected_from_family: familyAudit.correctedFromFamily,
-                enqueued_by: familyAudit.enqueuedBy,
-                submission: {
-                    promoted_profile: promotedProfile,
-                    submitter_email: args.submitterEmailBase,
-                    confirm_submit: args.confirmSubmit,
-                },
-                wait: undefined,
-                skip_reason_code: undefined,
-                terminal_class: undefined,
-                lease_expires_at: undefined,
-            };
-        })()
-        : buildTask({
-            taskId: args.taskId,
-            targetUrl: args.targetUrl,
-            promotedProfile,
-            submitterEmailBase: args.submitterEmailBase,
-            confirmSubmit: args.confirmSubmit,
-            flowFamily: args.flowFamily,
+    if (existingTask) {
+        const familyAudit = deriveFlowFamilyAudit({
+            existingTask,
+            requestedFlowFamily: args.flowFamily,
             enqueuedBy: args.enqueuedBy,
+            now,
         });
-    updateTaskStatus(task, "READY");
-    task.notes.push("Task was enqueued for the bounded single-site worker.");
+        const task = {
+            ...existingTask,
+            target_url: args.targetUrl,
+            hostname: targetHostname,
+            flow_family: familyAudit.flowFamily,
+            flow_family_source: familyAudit.flowFamilySource,
+            flow_family_reason: familyAudit.flowFamilyReason,
+            flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
+            corrected_from_family: familyAudit.correctedFromFamily,
+            enqueued_by: familyAudit.enqueuedBy,
+            submission: {
+                promoted_profile: promotedProfile,
+                submitter_email: args.submitterEmailBase,
+                confirm_submit: args.confirmSubmit,
+            },
+        };
+        prepareTaskForReenqueue(task);
+        markTaskStageTimestamp(task, "enqueued_at", now);
+        applyTargetPreflightToTask({ task, historicalTasks: tasks, now });
+        updateTaskStatus(task, "READY");
+        task.notes.push(`Task id ${args.taskId} was re-enqueued for the bounded single-site worker (score ${getTaskQueuePriorityScore(task)}).`);
+        await saveTask(task);
+        return {
+            outcome: "reactivated_existing_task",
+            reason: `Re-enqueued existing task ${task.id} by task id.`,
+            task,
+            duplicate_of_task_id: task.id,
+        };
+    }
+    const duplicates = findExactHostDuplicateTasks({
+        tasks,
+        promotedHostname: promotedProfile.hostname,
+        targetHostname,
+        excludeTaskId: args.taskId,
+    });
+    const duplicateTask = duplicates[0];
+    if (duplicateTask) {
+        if (duplicateTask.status === "DONE") {
+            duplicateTask.notes.push(`Blocked duplicate enqueue for exact host ${targetHostname}; task ${duplicateTask.id} already completed this promoted profile.`);
+            await saveTask(duplicateTask);
+            return {
+                outcome: "blocked_duplicate_task",
+                reason: `Blocked duplicate enqueue because ${duplicateTask.id} already finished this exact host.`,
+                task: duplicateTask,
+                duplicate_of_task_id: duplicateTask.id,
+            };
+        }
+        if (duplicateTask.status === "RUNNING" ||
+            duplicateTask.status === "READY" ||
+            duplicateTask.status === "WAITING_EXTERNAL_EVENT" ||
+            duplicateTask.status === "WAITING_SITE_RESPONSE" ||
+            duplicateTask.status === "WAITING_MANUAL_AUTH" ||
+            duplicateTask.status === "WAITING_MISSING_INPUT" ||
+            duplicateTask.status === "WAITING_POLICY_DECISION") {
+            applyTargetPreflightToTask({ task: duplicateTask, historicalTasks: tasks, now });
+            duplicateTask.notes.push(`Reused existing exact-host task ${duplicateTask.id} instead of opening a parallel queue entry for ${targetHostname}.`);
+            await saveTask(duplicateTask);
+            return {
+                outcome: "reused_existing_task",
+                reason: `Reused existing task ${duplicateTask.id} for the same promoted host + exact target host.`,
+                task: duplicateTask,
+                duplicate_of_task_id: duplicateTask.id,
+            };
+        }
+        const familyAudit = deriveFlowFamilyAudit({
+            existingTask: duplicateTask,
+            requestedFlowFamily: args.flowFamily,
+            enqueuedBy: args.enqueuedBy,
+            now,
+        });
+        const reactivatedTask = {
+            ...duplicateTask,
+            target_url: args.targetUrl,
+            hostname: targetHostname,
+            flow_family: familyAudit.flowFamily,
+            flow_family_source: familyAudit.flowFamilySource,
+            flow_family_reason: familyAudit.flowFamilyReason,
+            flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
+            corrected_from_family: familyAudit.correctedFromFamily,
+            enqueued_by: familyAudit.enqueuedBy,
+            submission: {
+                promoted_profile: promotedProfile,
+                submitter_email: args.submitterEmailBase,
+                confirm_submit: args.confirmSubmit,
+            },
+        };
+        prepareTaskForReenqueue(reactivatedTask);
+        markTaskStageTimestamp(reactivatedTask, "enqueued_at", now);
+        applyTargetPreflightToTask({ task: reactivatedTask, historicalTasks: tasks, now });
+        updateTaskStatus(reactivatedTask, "READY");
+        reactivatedTask.notes.push(`Reactivated exact-host duplicate ${reactivatedTask.id} instead of creating a new task (score ${getTaskQueuePriorityScore(reactivatedTask)}).`);
+        await saveTask(reactivatedTask);
+        return {
+            outcome: "reactivated_existing_task",
+            reason: `Reactivated existing task ${reactivatedTask.id} for the same promoted host + exact target host.`,
+            task: reactivatedTask,
+            duplicate_of_task_id: reactivatedTask.id,
+        };
+    }
+    const task = buildTask({
+        taskId: args.taskId,
+        targetUrl: args.targetUrl,
+        promotedProfile,
+        submitterEmailBase: args.submitterEmailBase,
+        confirmSubmit: args.confirmSubmit,
+        flowFamily: args.flowFamily,
+        enqueuedBy: args.enqueuedBy,
+    });
+    applyTargetPreflightToTask({ task, historicalTasks: tasks, now });
+    task.notes.push(`Task was enqueued for the bounded single-site worker (score ${getTaskQueuePriorityScore(task)}).`);
     await saveTask(task);
-    return task;
+    return {
+        outcome: "accept_new_task",
+        reason: `Accepted new task ${task.id}.`,
+        task,
+    };
 }
 export async function claimNextTask(args) {
     const { reapedTaskId } = await reapExpiredQueueState();
@@ -1118,6 +1233,9 @@ export async function claimNextTask(args) {
             reapedTaskId,
         };
     }
+    if (!nextTask.target_preflight || nextTask.queue_priority_score === undefined) {
+        applyTargetPreflightToTask({ task: nextTask, historicalTasks: tasks });
+    }
     const now = Date.now();
     const lease = {
         task_id: nextTask.id,
@@ -1133,13 +1251,14 @@ export async function claimNextTask(args) {
     };
     nextTask.run_count += 1;
     updateTaskStatus(nextTask, "RUNNING");
+    markTaskStageTimestamp(nextTask, "claimed_at", new Date(now).toISOString());
     nextTask.wait = undefined;
     nextTask.terminal_class = undefined;
     nextTask.skip_reason_code = undefined;
     nextTask.reactivation_cooldown_until = undefined;
     nextTask.reactivation_cooldown_reason = undefined;
     nextTask.lease_expires_at = lease.expires_at;
-    nextTask.notes.push(`Claimed by ${args.owner} for ${lane} lane run.`);
+    nextTask.notes.push(`Claimed by ${args.owner} for ${lane} lane run (score ${getTaskQueuePriorityScore(nextTask)}).`);
     await saveTask(nextTask);
     await saveWorkerLease(lease, leaseGroup);
     return {

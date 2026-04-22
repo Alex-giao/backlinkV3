@@ -18,6 +18,7 @@ import { resolveBrowserRuntime } from "../shared/browser-runtime.js";
 import { buildMailboxQuery, buildPlusAlias, generateSignupUsername, generateSitePassword } from "../shared/email.js";
 import { runPreflight } from "../shared/preflight.js";
 import { updateTaskExecutionStateFromOutcome, updateTaskExecutionStateFromScout } from "../shared/task-progress.js";
+import { markTaskStageTimestamp } from "../shared/task-timing.js";
 import type {
   AccountRecord,
   BrowserRuntime,
@@ -307,6 +308,7 @@ async function stopTaskForOutcome(args: {
     args.task.email_verification_continuation = undefined;
   }
   args.task.notes.push(args.detail);
+  markTaskStageTimestamp(args.task, "prepare_finished_at");
   updateTaskStatus(args.task, args.nextStatus);
   updateTaskExecutionStateFromOutcome({
     task: args.task,
@@ -385,6 +387,7 @@ async function stopTaskForRetry(args: {
   };
   args.task.terminal_class = args.task.terminal_class ?? "outcome_not_confirmed";
   args.task.notes.push(args.detail);
+  markTaskStageTimestamp(args.task, "prepare_finished_at");
   updateTaskStatus(args.task, "RETRYABLE");
   updateTaskExecutionStateFromOutcome({
     task: args.task,
@@ -426,6 +429,8 @@ export async function prepareTaskForAgent(args: {
     throw new Error(`Task ${args.taskId} does not exist.`);
   }
 
+  markTaskStageTimestamp(task, "prepare_started_at");
+
   const runtime = await runPreflight(await resolveBrowserRuntime(args.cdpUrl));
   const preflightPath = getLatestPreflightPath();
   await writeJsonFile(preflightPath, runtime);
@@ -460,6 +465,7 @@ export async function prepareTaskForAgent(args: {
         task.wait = replayResult.wait;
         task.terminal_class = replayResult.terminal_class;
         task.skip_reason_code = replayResult.skip_reason_code;
+        markTaskStageTimestamp(task, "prepare_finished_at");
         updateTaskStatus(task, replayResult.next_status);
         await saveTask(task);
         await clearWorkerLeaseForTask(task.id);
@@ -642,6 +648,7 @@ export async function prepareTaskForAgent(args: {
       });
     }
 
+    markTaskStageTimestamp(task, "prepare_finished_at");
     await saveTask(task);
     return {
       mode: "ready_for_agent_loop",

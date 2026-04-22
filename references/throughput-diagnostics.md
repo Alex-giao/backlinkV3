@@ -4,12 +4,20 @@ Use this when a bounded BacklinkHelper V3 cron/worker feels too slow for product
 
 ## What to measure first
 
-1. Cron output cadence
+1. Task stage timestamps
+   - Read `task.stage_timestamps` first.
+   - Split latency into at least:
+     - `enqueued_at -> claimed_at`
+     - `prepare_started_at -> prepare_finished_at`
+     - `trace_recorded_at -> finalize_finished_at`
+   - Prefer these fields over artifact-time inference whenever they exist.
+
+2. Cron output cadence
    - Inspect `~/.hermes/cron/output/<job_id>/*.md` timestamps.
    - Compare actual output interval vs nominal schedule.
    - If a job scheduled every 5m is producing outputs every 20m+ on average, the bottleneck is execution duration / serialization, not queue starvation.
 
-2. Queue progress semantics
+3. Queue progress semantics
    - Do **not** equate `total - READY` with "completed".
    - Split inventory into:
      - touched = `total - READY`
@@ -17,7 +25,7 @@ Use this when a bounded BacklinkHelper V3 cron/worker feels too slow for product
      - nonterminal touched = `WAITING_SITE_RESPONSE + WAITING_EXTERNAL_EVENT + RETRYABLE + RUNNING`
    - Report both touched and closed; otherwise throughput will be overstated.
 
-3. Task-file reality check
+4. Task-file reality check
    - Read `data/backlink-helper/tasks/<prefix>*.json` and aggregate:
      - `status`
      - `flow_family`
