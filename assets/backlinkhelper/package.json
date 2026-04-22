@@ -6,7 +6,7 @@
   "description": "Minimal executable backbone for shared-CDP backlink submission workflows.",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "pnpm build && node --test dist/**/*.test.js",
+    "test": "corepack pnpm build && node --test dist/**/*.test.js",
     "start-browser": "node dist/cli/index.js start-browser",
     "preflight": "node dist/cli/index.js preflight",
     "enqueue-site": "node dist/cli/index.js enqueue-site",

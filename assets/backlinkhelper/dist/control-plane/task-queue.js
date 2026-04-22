@@ -102,6 +102,13 @@ export function deriveFlowFamilyAudit(args) {
         enqueuedBy,
     };
 }
+function buildIncomingSubmissionContext(args) {
+    return {
+        promoted_profile: args.promotedProfile,
+        submitter_email: args.submitterEmailBase,
+        confirm_submit: args.confirmSubmit,
+    };
+}
 function buildTask(args) {
     const now = new Date().toISOString();
     const familyAudit = deriveFlowFamilyAudit({
@@ -119,11 +126,11 @@ function buildTask(args) {
         flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
         corrected_from_family: familyAudit.correctedFromFamily,
         enqueued_by: familyAudit.enqueuedBy,
-        submission: {
-            promoted_profile: args.promotedProfile,
-            submitter_email: args.submitterEmailBase,
-            confirm_submit: args.confirmSubmit,
-        },
+        submission: buildIncomingSubmissionContext({
+            promotedProfile: args.promotedProfile,
+            submitterEmailBase: args.submitterEmailBase,
+            confirmSubmit: args.confirmSubmit,
+        }),
         status: "READY",
         created_at: now,
         updated_at: now,
@@ -137,6 +144,77 @@ function buildTask(args) {
         latest_artifacts: [],
         notes: [],
     };
+}
+export function shouldReuseExactHostDuplicateTask(args) {
+    const targetHostname = new URL(args.targetUrl).hostname;
+    if (args.task.target_url !== args.targetUrl || args.task.hostname !== targetHostname) {
+        return false;
+    }
+    if (resolveFlowFamily(args.task.flow_family) !== resolveFlowFamily(args.flowFamily)) {
+        return false;
+    }
+    const incomingSubmission = buildIncomingSubmissionContext({
+        promotedProfile: args.promotedProfile,
+        submitterEmailBase: args.submitterEmailBase,
+        confirmSubmit: args.confirmSubmit,
+    });
+    return JSON.stringify(args.task.submission) === JSON.stringify(incomingSubmission);
+}
+function buildReenqueuedTaskFromExisting(args) {
+    const targetHostname = new URL(args.targetUrl).hostname;
+    let familyAudit;
+    if (args.preserveExistingFlowFamilyWhenOmitted === false && !args.flowFamily) {
+        const defaultedFamily = resolveFlowFamily(args.flowFamily);
+        const existingFamily = resolveFlowFamily(args.existingTask.flow_family);
+        const enqueuedBy = args.enqueuedBy ?? args.existingTask.enqueued_by ?? "enqueue-site";
+        familyAudit =
+            defaultedFamily === existingFamily
+                ? {
+                    flowFamily: existingFamily,
+                    flowFamilySource: "carried_forward",
+                    flowFamilyReason: `Re-enqueue preserved existing flow family ${existingFamily}.`,
+                    flowFamilyUpdatedAt: args.now,
+                    correctedFromFamily: args.existingTask.corrected_from_family,
+                    enqueuedBy,
+                }
+                : {
+                    flowFamily: defaultedFamily,
+                    flowFamilySource: "corrected",
+                    flowFamilyReason: `Flow family corrected from ${existingFamily} to ${defaultedFamily} because the new enqueue omitted flow family and default semantics apply.`,
+                    flowFamilyUpdatedAt: args.now,
+                    correctedFromFamily: existingFamily,
+                    enqueuedBy,
+                };
+    }
+    else {
+        familyAudit = deriveFlowFamilyAudit({
+            existingTask: args.existingTask,
+            requestedFlowFamily: args.flowFamily,
+            enqueuedBy: args.enqueuedBy,
+            now: args.now,
+        });
+    }
+    const task = {
+        ...args.existingTask,
+        target_url: args.targetUrl,
+        hostname: targetHostname,
+        flow_family: familyAudit.flowFamily,
+        flow_family_source: familyAudit.flowFamilySource,
+        flow_family_reason: familyAudit.flowFamilyReason,
+        flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
+        corrected_from_family: familyAudit.correctedFromFamily,
+        enqueued_by: familyAudit.enqueuedBy,
+        submission: buildIncomingSubmissionContext({
+            promotedProfile: args.promotedProfile,
+            submitterEmailBase: args.submitterEmailBase,
+            confirmSubmit: args.confirmSubmit,
+        }),
+    };
+    prepareTaskForReenqueue(task);
+    markTaskStageTimestamp(task, "enqueued_at", args.now);
+    applyTargetPreflightToTask({ task, historicalTasks: args.historicalTasks, now: args.now });
+    updateTaskStatus(task, "READY");
+    return task;
 }
 function applyTargetPreflightToTask(args) {
     const assessment = buildTargetPreflightAssessment({
@@ -1066,32 +1144,17 @@ export async function enqueueSiteTask(args) {
         throw new Error(`Task ${args.taskId} is already RUNNING and cannot be re-enqueued.`);
     }
     if (existingTask) {
-        const familyAudit = deriveFlowFamilyAudit({
+        const task = buildReenqueuedTaskFromExisting({
             existingTask,
-            requestedFlowFamily: args.flowFamily,
+            targetUrl: args.targetUrl,
+            promotedProfile,
+            submitterEmailBase: args.submitterEmailBase,
+            confirmSubmit: args.confirmSubmit,
+            flowFamily: args.flowFamily,
             enqueuedBy: args.enqueuedBy,
+            historicalTasks: tasks,
             now,
         });
-        const task = {
-            ...existingTask,
-            target_url: args.targetUrl,
-            hostname: targetHostname,
-            flow_family: familyAudit.flowFamily,
-            flow_family_source: familyAudit.flowFamilySource,
-            flow_family_reason: familyAudit.flowFamilyReason,
-            flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
-            corrected_from_family: familyAudit.correctedFromFamily,
-            enqueued_by: familyAudit.enqueuedBy,
-            submission: {
-                promoted_profile: promotedProfile,
-                submitter_email: args.submitterEmailBase,
-                confirm_submit: args.confirmSubmit,
-            },
-        };
-        prepareTaskForReenqueue(task);
-        markTaskStageTimestamp(task, "enqueued_at", now);
-        applyTargetPreflightToTask({ task, historicalTasks: tasks, now });
-        updateTaskStatus(task, "READY");
         task.notes.push(`Task id ${args.taskId} was re-enqueued for the bounded single-site worker (score ${getTaskQueuePriorityScore(task)}).`);
         await saveTask(task);
         return {
@@ -1107,61 +1170,123 @@ export async function enqueueSiteTask(args) {
         targetHostname,
         excludeTaskId: args.taskId,
     });
-    const duplicateTask = duplicates[0];
-    if (duplicateTask) {
-        if (duplicateTask.status === "DONE") {
-            duplicateTask.notes.push(`Blocked duplicate enqueue for exact host ${targetHostname}; task ${duplicateTask.id} already completed this promoted profile.`);
-            await saveTask(duplicateTask);
+    if (duplicates.length > 0) {
+        const duplicateWithSamePayload = duplicates.find((task) => shouldReuseExactHostDuplicateTask({
+            task,
+            targetUrl: args.targetUrl,
+            promotedProfile,
+            submitterEmailBase: args.submitterEmailBase,
+            confirmSubmit: args.confirmSubmit,
+            flowFamily: args.flowFamily,
+        }));
+        if (duplicateWithSamePayload) {
+            if (duplicateWithSamePayload.status === "DONE") {
+                duplicateWithSamePayload.notes.push(`Blocked duplicate enqueue for exact host ${targetHostname}; task ${duplicateWithSamePayload.id} already completed this promoted profile.`);
+                await saveTask(duplicateWithSamePayload);
+                return {
+                    outcome: "blocked_duplicate_task",
+                    reason: `Blocked duplicate enqueue because ${duplicateWithSamePayload.id} already finished this exact host.`,
+                    task: duplicateWithSamePayload,
+                    duplicate_of_task_id: duplicateWithSamePayload.id,
+                };
+            }
+            if (duplicateWithSamePayload.status === "RUNNING" ||
+                duplicateWithSamePayload.status === "READY" ||
+                duplicateWithSamePayload.status === "WAITING_EXTERNAL_EVENT" ||
+                duplicateWithSamePayload.status === "WAITING_SITE_RESPONSE" ||
+                duplicateWithSamePayload.status === "WAITING_MANUAL_AUTH" ||
+                duplicateWithSamePayload.status === "WAITING_MISSING_INPUT" ||
+                duplicateWithSamePayload.status === "WAITING_POLICY_DECISION") {
+                applyTargetPreflightToTask({ task: duplicateWithSamePayload, historicalTasks: tasks, now });
+                duplicateWithSamePayload.notes.push(`Reused existing exact-host task ${duplicateWithSamePayload.id} instead of opening a parallel queue entry for ${targetHostname}.`);
+                await saveTask(duplicateWithSamePayload);
+                return {
+                    outcome: "reused_existing_task",
+                    reason: `Reused existing task ${duplicateWithSamePayload.id} for the same promoted host + exact target host.`,
+                    task: duplicateWithSamePayload,
+                    duplicate_of_task_id: duplicateWithSamePayload.id,
+                };
+            }
+            const reactivatedEquivalentTask = buildReenqueuedTaskFromExisting({
+                existingTask: duplicateWithSamePayload,
+                targetUrl: args.targetUrl,
+                promotedProfile,
+                submitterEmailBase: args.submitterEmailBase,
+                confirmSubmit: args.confirmSubmit,
+                flowFamily: args.flowFamily,
+                enqueuedBy: args.enqueuedBy,
+                historicalTasks: tasks,
+                now,
+                preserveExistingFlowFamilyWhenOmitted: false,
+            });
+            reactivatedEquivalentTask.notes.push(`Reactivated equivalent exact-host task ${reactivatedEquivalentTask.id} instead of opening a parallel queue entry for ${targetHostname} (score ${getTaskQueuePriorityScore(reactivatedEquivalentTask)}).`);
+            await saveTask(reactivatedEquivalentTask);
             return {
-                outcome: "blocked_duplicate_task",
-                reason: `Blocked duplicate enqueue because ${duplicateTask.id} already finished this exact host.`,
-                task: duplicateTask,
-                duplicate_of_task_id: duplicateTask.id,
+                outcome: "reactivated_existing_task",
+                reason: `Reactivated equivalent task ${reactivatedEquivalentTask.id} for the same promoted host + exact target host.`,
+                task: reactivatedEquivalentTask,
+                duplicate_of_task_id: reactivatedEquivalentTask.id,
             };
         }
-        if (duplicateTask.status === "RUNNING" ||
-            duplicateTask.status === "READY" ||
+        const runningPayloadConflict = duplicates.find((task) => task.status === "RUNNING" &&
+            !shouldReuseExactHostDuplicateTask({
+                task,
+                targetUrl: args.targetUrl,
+                promotedProfile,
+                submitterEmailBase: args.submitterEmailBase,
+                confirmSubmit: args.confirmSubmit,
+                flowFamily: args.flowFamily,
+            }));
+        const duplicateTask = duplicates.find((task) => task.status !== "DONE") ?? duplicates[0];
+        if (runningPayloadConflict) {
+            runningPayloadConflict.notes.push(`Blocked duplicate enqueue for exact host ${targetHostname}; running task ${runningPayloadConflict.id} has a different authoritative payload and cannot be overwritten while running.`);
+            await saveTask(runningPayloadConflict);
+            return {
+                outcome: "blocked_duplicate_task",
+                reason: `Blocked duplicate enqueue because running task ${runningPayloadConflict.id} has a different authoritative payload.`,
+                task: runningPayloadConflict,
+                duplicate_of_task_id: runningPayloadConflict.id,
+            };
+        }
+        if (duplicateTask.status === "READY" ||
             duplicateTask.status === "WAITING_EXTERNAL_EVENT" ||
             duplicateTask.status === "WAITING_SITE_RESPONSE" ||
             duplicateTask.status === "WAITING_MANUAL_AUTH" ||
             duplicateTask.status === "WAITING_MISSING_INPUT" ||
             duplicateTask.status === "WAITING_POLICY_DECISION") {
-            applyTargetPreflightToTask({ task: duplicateTask, historicalTasks: tasks, now });
-            duplicateTask.notes.push(`Reused existing exact-host task ${duplicateTask.id} instead of opening a parallel queue entry for ${targetHostname}.`);
-            await saveTask(duplicateTask);
+            const reactivatedTask = buildReenqueuedTaskFromExisting({
+                existingTask: duplicateTask,
+                targetUrl: args.targetUrl,
+                promotedProfile,
+                submitterEmailBase: args.submitterEmailBase,
+                confirmSubmit: args.confirmSubmit,
+                flowFamily: args.flowFamily,
+                enqueuedBy: args.enqueuedBy,
+                historicalTasks: tasks,
+                now,
+                preserveExistingFlowFamilyWhenOmitted: false,
+            });
+            reactivatedTask.notes.push(`Authoritative enqueue payload replaced existing exact-host task ${reactivatedTask.id}; target/submission/family changed and the task was reset to READY (score ${getTaskQueuePriorityScore(reactivatedTask)}).`);
+            await saveTask(reactivatedTask);
             return {
-                outcome: "reused_existing_task",
-                reason: `Reused existing task ${duplicateTask.id} for the same promoted host + exact target host.`,
-                task: duplicateTask,
-                duplicate_of_task_id: duplicateTask.id,
+                outcome: "reactivated_existing_task",
+                reason: `Authoritatively updated existing task ${reactivatedTask.id} for the same promoted host + exact target host.`,
+                task: reactivatedTask,
+                duplicate_of_task_id: reactivatedTask.id,
             };
         }
-        const familyAudit = deriveFlowFamilyAudit({
+        const reactivatedTask = buildReenqueuedTaskFromExisting({
             existingTask: duplicateTask,
-            requestedFlowFamily: args.flowFamily,
+            targetUrl: args.targetUrl,
+            promotedProfile,
+            submitterEmailBase: args.submitterEmailBase,
+            confirmSubmit: args.confirmSubmit,
+            flowFamily: args.flowFamily,
             enqueuedBy: args.enqueuedBy,
+            historicalTasks: tasks,
             now,
+            preserveExistingFlowFamilyWhenOmitted: false,
         });
-        const reactivatedTask = {
-            ...duplicateTask,
-            target_url: args.targetUrl,
-            hostname: targetHostname,
-            flow_family: familyAudit.flowFamily,
-            flow_family_source: familyAudit.flowFamilySource,
-            flow_family_reason: familyAudit.flowFamilyReason,
-            flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
-            corrected_from_family: familyAudit.correctedFromFamily,
-            enqueued_by: familyAudit.enqueuedBy,
-            submission: {
-                promoted_profile: promotedProfile,
-                submitter_email: args.submitterEmailBase,
-                confirm_submit: args.confirmSubmit,
-            },
-        };
-        prepareTaskForReenqueue(reactivatedTask);
-        markTaskStageTimestamp(reactivatedTask, "enqueued_at", now);
-        applyTargetPreflightToTask({ task: reactivatedTask, historicalTasks: tasks, now });
-        updateTaskStatus(reactivatedTask, "READY");
         reactivatedTask.notes.push(`Reactivated exact-host duplicate ${reactivatedTask.id} instead of creating a new task (score ${getTaskQueuePriorityScore(reactivatedTask)}).`);
         await saveTask(reactivatedTask);
         return {
