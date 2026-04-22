@@ -1,6 +1,7 @@
 import { acquireBrowserOwnership, releaseBrowserOwnership } from "../execution/ownership-lock.js";
 import { runTrajectoryReplay } from "../execution/replay.js";
 import { runLightweightScout } from "../execution/scout.js";
+import { classifyEarlyTerminalOutcome } from "../execution/takeover.js";
 import { getAccountForHostname } from "../memory/account-registry.js";
 import { getCredential } from "../memory/credential-vault.js";
 import { clearWorkerLeaseForTask, ensureDataDirectories, getArtifactFilePath, getLatestPreflightPath, loadTask, saveTask, writeJsonFile, } from "../memory/data-store.js";
@@ -164,6 +165,99 @@ export function inferOpportunityClassFromScout(_task, scout) {
     }
     return "recovery_ambiguous";
 }
+function buildScoutTerminalBoundaryText(scout) {
+    const embedText = (scout.embed_hints ?? [])
+        .map((hint) => [
+        hint.provider,
+        hint.frame_title,
+        hint.frame_url,
+        hint.body_text_excerpt,
+        ...(hint.cta_candidates ?? []),
+        ...(hint.submit_candidates ?? []),
+    ]
+        .filter((value) => typeof value === "string" && value.trim().length > 0)
+        .join("\n"))
+        .filter(Boolean)
+        .join("\n\n");
+    return [
+        scout.surface_summary,
+        scout.page_snapshot.title,
+        scout.page_snapshot.body_text_excerpt,
+        ...(scout.submit_candidates ?? []),
+        ...(scout.field_hints ?? []),
+        ...(scout.auth_hints ?? []),
+        ...(scout.anti_bot_hints ?? []),
+        embedText,
+    ]
+        .filter((value) => typeof value === "string" && value.trim().length > 0)
+        .join("\n");
+}
+export function classifyScoutTerminalBoundary(args) {
+    if (!args.scout.ok || args.scout.page_assessment?.page_reachable !== true) {
+        return undefined;
+    }
+    const classification = classifyEarlyTerminalOutcome({
+        currentUrl: args.scout.page_snapshot.url || args.task.target_url,
+        title: args.scout.page_snapshot.title,
+        bodyText: buildScoutTerminalBoundaryText(args.scout),
+        evidenceRef: args.evidenceRef,
+        flowFamily: args.task.flow_family,
+    });
+    const stoppableStates = new Set([
+        "SKIPPED",
+        "WAITING_POLICY_DECISION",
+        "WAITING_MANUAL_AUTH",
+        "WAITING_MISSING_INPUT",
+    ]);
+    if (classification.evidence_sufficiency !== "sufficient") {
+        return undefined;
+    }
+    if (classification.allow_rerun) {
+        return undefined;
+    }
+    if (!stoppableStates.has(classification.outcome.next_status)) {
+        return undefined;
+    }
+    return classification;
+}
+async function stopTaskForOutcome(args) {
+    args.task.wait = args.wait;
+    args.task.terminal_class = args.terminalClass;
+    args.task.skip_reason_code = args.skipReasonCode;
+    args.task.last_takeover_outcome = args.detail;
+    if (args.nextStatus !== "RETRYABLE") {
+        args.task.email_verification_continuation = undefined;
+    }
+    args.task.notes.push(args.detail);
+    updateTaskStatus(args.task, args.nextStatus);
+    updateTaskExecutionStateFromOutcome({
+        task: args.task,
+        nextStatus: args.nextStatus,
+        detail: args.detail,
+        wait: args.wait,
+        terminalClass: args.terminalClass,
+        currentUrl: args.scout?.page_snapshot.url ?? args.task.target_url,
+        currentTitle: args.scout?.page_snapshot.title,
+        artifactRefs: [args.evidenceRef, args.scoutArtifactRef].filter((value) => Boolean(value)),
+        source: "prepare",
+    });
+    await saveTask(args.task);
+    await clearWorkerLeaseForTask(args.task.id);
+    return {
+        mode: "task_stopped",
+        task: args.task,
+        effective_target_url: args.task.target_url,
+        replay_hit: args.replayHit,
+        scout_artifact_ref: args.scoutArtifactRef,
+        scout: args.scout,
+        account_candidate: args.accountCandidate,
+        account_credentials: args.accountCredentials,
+        registration_required: args.registrationRequired,
+        registration_email_alias: args.registrationEmailAlias,
+        mailbox_query: args.mailboxQuery,
+        email_verification_continuation: args.task.email_verification_continuation,
+    };
+}
 function inferPreflightFailure(args) {
     if (!args.runtime.preflight_checks.cdp_runtime.ok) {
         return {
@@ -218,6 +312,7 @@ async function stopTaskForRetry(args) {
         registration_required: args.registrationRequired,
         registration_email_alias: args.registrationEmailAlias,
         mailbox_query: args.mailboxQuery,
+        email_verification_continuation: args.task.email_verification_continuation,
     };
 }
 export async function prepareTaskForAgent(args) {
@@ -361,6 +456,25 @@ export async function prepareTaskForAgent(args) {
             scout,
             artifactRef: scoutArtifactPath,
         });
+        const scoutTerminalBoundary = classifyScoutTerminalBoundary({
+            task,
+            scout,
+            evidenceRef: scoutArtifactPath,
+        });
+        if (scoutTerminalBoundary) {
+            return stopTaskForOutcome({
+                task,
+                replayHit: Boolean(replayPlaybook),
+                nextStatus: scoutTerminalBoundary.outcome.next_status,
+                detail: scoutTerminalBoundary.outcome.detail,
+                wait: scoutTerminalBoundary.outcome.wait,
+                terminalClass: scoutTerminalBoundary.outcome.terminal_class,
+                skipReasonCode: scoutTerminalBoundary.outcome.skip_reason_code,
+                evidenceRef: scoutArtifactPath,
+                scoutArtifactRef: scoutArtifactPath,
+                scout,
+            });
+        }
         let accountCandidate = await getAccountForHostname(task.hostname);
         let accountCredentials = accountCandidate?.credential_ref
             ? await getCredential(accountCandidate.credential_ref).catch(() => undefined)
@@ -413,6 +527,7 @@ export async function prepareTaskForAgent(args) {
             registration_required: registrationRequired,
             registration_email_alias: registrationEmailAlias,
             mailbox_query: mailboxQuery,
+            email_verification_continuation: task.email_verification_continuation,
         };
     }
     finally {

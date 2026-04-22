@@ -1,6 +1,6 @@
 import { runInitGate } from "../control-plane/init-gate.js";
 import { claimNextTask } from "../control-plane/task-queue.js";
-import type { InitGateMode } from "../shared/types.js";
+import type { ClaimLane, InitGateMode } from "../shared/types.js";
 
 export async function runClaimNextTaskCommand(args: {
   owner: string;
@@ -9,6 +9,7 @@ export async function runClaimNextTaskCommand(args: {
   promotedUrl?: string;
   requireCompleteProfile?: boolean;
   initGateMode?: InitGateMode;
+  lane?: ClaimLane;
 }): Promise<void> {
   if (args.requireCompleteProfile && (args.promotedUrl || args.promotedHostname)) {
     const gate = await runInitGate({
@@ -24,6 +25,7 @@ export async function runClaimNextTaskCommand(args: {
 
   const result = await claimNextTask({
     owner: args.owner,
+    lane: args.lane,
     scope: {
       taskIdPrefix: args.taskIdPrefix,
       promotedHostname: args.promotedHostname,

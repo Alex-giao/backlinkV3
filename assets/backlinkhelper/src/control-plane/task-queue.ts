@@ -13,7 +13,18 @@ import {
 } from "../memory/data-store.js";
 import { loadBrowserOwnership, reapExpiredBrowserOwnership } from "../execution/ownership-lock.js";
 import { BOUNDED_WORKER_LEASE_TTL_MS } from "../shared/runtime-budgets.js";
-import type { ResolutionMode, ResolutionOwner, TaskRecord, TaskStatus, TerminalClass, WorkerLease } from "../shared/types.js";
+import type {
+  ClaimLane,
+  FlowFamilySource,
+  ResolutionMode,
+  ResolutionOwner,
+  TaskLane,
+  TaskRecord,
+  TaskStatus,
+  TerminalClass,
+  WorkerLease,
+  WorkerLeaseGroup,
+} from "../shared/types.js";
 
 const RETRY_BACKOFF_MS = 60 * 60 * 1_000;
 const MAX_AUTOMATIC_RETRIES = 1;
@@ -135,6 +146,70 @@ const DEFAULT_GUARDED_REACTIVATION_BUCKETS: RetryDecisionBucket[] = [
   "runtime_reactivate_ready",
 ];
 
+export function deriveFlowFamilyAudit(args: {
+  requestedFlowFamily?: TaskRecord["flow_family"];
+  existingTask?: Pick<TaskRecord, "flow_family" | "corrected_from_family" | "enqueued_by">;
+  enqueuedBy?: string;
+  now?: string;
+}): {
+  flowFamily: NonNullable<TaskRecord["flow_family"]>;
+  flowFamilySource: FlowFamilySource;
+  flowFamilyReason: string;
+  flowFamilyUpdatedAt: string;
+  correctedFromFamily?: TaskRecord["flow_family"];
+  enqueuedBy: string;
+} {
+  const now = args.now ?? new Date().toISOString();
+  const enqueuedBy = args.enqueuedBy ?? args.existingTask?.enqueued_by ?? "enqueue-site";
+  const requested = resolveFlowFamily(args.requestedFlowFamily);
+
+  if (!args.existingTask) {
+    const flowFamilySource: FlowFamilySource = args.requestedFlowFamily ? "explicit" : "defaulted";
+    return {
+      flowFamily: requested,
+      flowFamilySource,
+      flowFamilyReason:
+        flowFamilySource === "explicit"
+          ? `Flow family ${requested} was supplied explicitly at enqueue time.`
+          : `No flow family was supplied at enqueue time; defaulted to ${requested}.`,
+      flowFamilyUpdatedAt: now,
+      enqueuedBy,
+    };
+  }
+
+  const existingFamily = resolveFlowFamily(args.existingTask.flow_family);
+  if (!args.requestedFlowFamily) {
+    return {
+      flowFamily: existingFamily,
+      flowFamilySource: "carried_forward",
+      flowFamilyReason: `Re-enqueue preserved existing flow family ${existingFamily}.`,
+      flowFamilyUpdatedAt: now,
+      correctedFromFamily: args.existingTask.corrected_from_family,
+      enqueuedBy,
+    };
+  }
+
+  if (requested !== existingFamily) {
+    return {
+      flowFamily: requested,
+      flowFamilySource: "corrected",
+      flowFamilyReason: `Flow family corrected from ${existingFamily} to ${requested} during re-enqueue.`,
+      flowFamilyUpdatedAt: now,
+      correctedFromFamily: existingFamily,
+      enqueuedBy,
+    };
+  }
+
+  return {
+    flowFamily: requested,
+    flowFamilySource: "explicit",
+    flowFamilyReason: `Flow family ${requested} was explicitly reaffirmed during re-enqueue.`,
+    flowFamilyUpdatedAt: now,
+    correctedFromFamily: args.existingTask.corrected_from_family,
+    enqueuedBy,
+  };
+}
+
 function buildTask(args: {
   taskId: string;
   targetUrl: string;
@@ -142,13 +217,24 @@ function buildTask(args: {
   submitterEmailBase?: string;
   confirmSubmit: boolean;
   flowFamily?: TaskRecord["flow_family"];
+  enqueuedBy?: string;
 }): TaskRecord {
   const now = new Date().toISOString();
+  const familyAudit = deriveFlowFamilyAudit({
+    requestedFlowFamily: args.flowFamily,
+    enqueuedBy: args.enqueuedBy,
+    now,
+  });
   return {
     id: args.taskId,
     target_url: args.targetUrl,
     hostname: new URL(args.targetUrl).hostname,
-    flow_family: resolveFlowFamily(args.flowFamily),
+    flow_family: familyAudit.flowFamily,
+    flow_family_source: familyAudit.flowFamilySource,
+    flow_family_reason: familyAudit.flowFamilyReason,
+    flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
+    corrected_from_family: familyAudit.correctedFromFamily,
+    enqueued_by: familyAudit.enqueuedBy,
     submission: {
       promoted_profile: args.promotedProfile,
       submitter_email: args.submitterEmailBase,
@@ -198,6 +284,105 @@ function parseBucketList(values?: string[]): RetryDecisionBucket[] | undefined {
 
 function buildScopedTaskList(tasks: TaskRecord[], scope: TaskScopeFilter = {}): TaskRecord[] {
   return tasks.filter((task) => matchesTaskScope(task, scope));
+}
+
+const FOLLOW_UP_STATUSES = new Set<TaskStatus>(["WAITING_SITE_RESPONSE", "WAITING_EXTERNAL_EVENT"]);
+const AUTO_RESUMABLE_FOLLOW_UP_REASON_CODES = new Set(["EMAIL_VERIFICATION_PENDING"]);
+const LIGHTWEIGHT_SITE_RESPONSE_FOLLOW_UP_REASON_CODES = new Set([
+  "SITE_RESPONSE_PENDING",
+  "PROFILE_PUBLICATION_PENDING",
+  "COMMENT_MODERATION_PENDING",
+  "ARTICLE_SUBMITTED_PENDING_EDITORIAL",
+  "ARTICLE_PUBLICATION_PENDING",
+]);
+
+export function deriveTaskLane(task: Pick<TaskRecord, "status" | "flow_family">): TaskLane | undefined {
+  if (FOLLOW_UP_STATUSES.has(task.status)) {
+    return "follow_up";
+  }
+  if (task.status === "READY" || task.status === "RETRYABLE") {
+    return resolveFlowFamily(task.flow_family) === "saas_directory"
+      ? "directory_active"
+      : "non_directory_active";
+  }
+  return undefined;
+}
+
+export function resolveWorkerLeaseGroupForLane(lane: ClaimLane = "active_any"): WorkerLeaseGroup {
+  return lane === "follow_up" ? "follow_up" : "active";
+}
+
+export function matchesClaimLane(task: Pick<TaskRecord, "status" | "flow_family">, lane: ClaimLane = "active_any"): boolean {
+  const derived = deriveTaskLane(task);
+  if (!derived) {
+    return false;
+  }
+  if (lane === "active_any") {
+    return derived === "directory_active" || derived === "non_directory_active";
+  }
+  return derived === lane;
+}
+
+export function pickNextTaskForLane(tasks: TaskRecord[], lane: ClaimLane = "active_any"): TaskRecord | undefined {
+  if (lane === "follow_up") {
+    const emailFollowUpTasks = tasks
+      .filter(
+        (task) =>
+          matchesClaimLane(task, lane) &&
+          task.status === "WAITING_EXTERNAL_EVENT" &&
+          AUTO_RESUMABLE_FOLLOW_UP_REASON_CODES.has(task.wait?.wait_reason_code ?? ""),
+      )
+      .sort(compareByCreatedAt);
+
+    if (emailFollowUpTasks[0]) {
+      return emailFollowUpTasks[0];
+    }
+
+    return tasks
+      .filter(
+        (task) =>
+          matchesClaimLane(task, lane) &&
+          task.status === "WAITING_SITE_RESPONSE" &&
+          LIGHTWEIGHT_SITE_RESPONSE_FOLLOW_UP_REASON_CODES.has(task.wait?.wait_reason_code ?? ""),
+      )
+      .sort(compareByCreatedAt)[0];
+  }
+
+  const readyTasks = tasks
+    .filter((task) => task.status === "READY" && matchesClaimLane(task, lane))
+    .sort(compareByCreatedAt);
+  const retryableTasks = tasks
+    .filter((task) => canRetry(task) && matchesClaimLane(task, lane))
+    .sort(compareByCreatedAt);
+
+  return readyTasks[0] ?? retryableTasks[0];
+}
+
+export function buildTaskLaneReport(tasks: TaskRecord[]): {
+  totals: {
+    directory_active: number;
+    non_directory_active: number;
+    follow_up: number;
+    blocked_or_other: number;
+  };
+} {
+  const totals = {
+    directory_active: 0,
+    non_directory_active: 0,
+    follow_up: 0,
+    blocked_or_other: 0,
+  };
+
+  for (const task of tasks) {
+    const lane = deriveTaskLane(task);
+    if (!lane) {
+      totals.blocked_or_other += 1;
+      continue;
+    }
+    totals[lane] += 1;
+  }
+
+  return { totals };
 }
 
 export function isRetryExhausted(task: Pick<TaskRecord, "status" | "run_count">): boolean {
@@ -1073,13 +1258,15 @@ export async function repartitionRetryDecisionTasks(args: {
   };
 }
 
-async function reapExpiredWorkerLease(): Promise<{ reapedTaskId?: string }> {
-  const existingLease = await loadWorkerLease();
+async function reapExpiredWorkerLease(
+  group: WorkerLeaseGroup,
+): Promise<{ reapedTaskId?: string }> {
+  const existingLease = await loadWorkerLease(group);
   if (!existingLease || new Date(existingLease.expires_at).getTime() > Date.now()) {
     return {};
   }
 
-  await clearWorkerLease();
+  await clearWorkerLease(group);
   await clearPendingFinalize(existingLease.task_id);
 
   const task = await loadTask(existingLease.task_id);
@@ -1088,12 +1275,22 @@ async function reapExpiredWorkerLease(): Promise<{ reapedTaskId?: string }> {
   }
 
   task.lease_expires_at = undefined;
+  if (existingLease.previous_status && FOLLOW_UP_STATUSES.has(existingLease.previous_status)) {
+    task.wait = existingLease.previous_wait;
+    task.terminal_class = existingLease.previous_terminal_class;
+    task.skip_reason_code = existingLease.previous_skip_reason_code;
+    task.notes.push(`${group} worker timed out; restored the waiting checkpoint.`);
+    updateTaskStatus(task, existingLease.previous_status);
+    await saveTask(task);
+    return { reapedTaskId: task.id };
+  }
+
   task.wait = {
     wait_reason_code: "TASK_TIMEOUT",
     resume_trigger: "A previous bounded worker exceeded the 10 minute runtime lease and will be retried automatically.",
     resolution_owner: "system",
     resolution_mode: "auto_resume",
-    evidence_ref: "data/backlink-helper/runtime/task-worker-lease.json",
+    evidence_ref: `data/backlink-helper/runtime/${group === "active" ? "task-worker-lease.json" : `task-worker-lease-${group}.json`}`,
   };
   task.terminal_class = "outcome_not_confirmed";
   task.notes.push("bounded worker timed out");
@@ -1104,13 +1301,22 @@ async function reapExpiredWorkerLease(): Promise<{ reapedTaskId?: string }> {
 
 export async function reapExpiredQueueState(): Promise<{
   reapedTaskId?: string;
+  reapedTaskIds: string[];
   reapedBrowserOwnership: boolean;
 }> {
   await ensureDataDirectories();
-  const { reapedTaskId } = await reapExpiredWorkerLease();
+  const reapedTaskIds = (
+    await Promise.all([
+      reapExpiredWorkerLease("active"),
+      reapExpiredWorkerLease("follow_up"),
+    ])
+  )
+    .map((result) => result.reapedTaskId)
+    .filter((taskId): taskId is string => Boolean(taskId));
   const reapedBrowserOwnership = await reapExpiredBrowserOwnership();
   return {
-    reapedTaskId,
+    reapedTaskId: reapedTaskIds[0],
+    reapedTaskIds,
     reapedBrowserOwnership,
   };
 }
@@ -1124,6 +1330,7 @@ export async function enqueueSiteTask(args: {
   submitterEmailBase?: string;
   confirmSubmit: boolean;
   flowFamily?: TaskRecord["flow_family"];
+  enqueuedBy?: string;
 }): Promise<TaskRecord> {
   await ensureDataDirectories();
 
@@ -1139,21 +1346,33 @@ export async function enqueueSiteTask(args: {
   }
 
   const task = existingTask
-    ? {
-        ...existingTask,
-        target_url: args.targetUrl,
-        hostname: new URL(args.targetUrl).hostname,
-        flow_family: resolveFlowFamily(args.flowFamily ?? existingTask.flow_family),
-        submission: {
-          promoted_profile: promotedProfile,
-          submitter_email: args.submitterEmailBase,
-          confirm_submit: args.confirmSubmit,
-        },
-        wait: undefined,
-        skip_reason_code: undefined,
-        terminal_class: undefined,
-        lease_expires_at: undefined,
-      }
+    ? (() => {
+        const familyAudit = deriveFlowFamilyAudit({
+          existingTask,
+          requestedFlowFamily: args.flowFamily,
+          enqueuedBy: args.enqueuedBy,
+        });
+        return {
+          ...existingTask,
+          target_url: args.targetUrl,
+          hostname: new URL(args.targetUrl).hostname,
+          flow_family: familyAudit.flowFamily,
+          flow_family_source: familyAudit.flowFamilySource,
+          flow_family_reason: familyAudit.flowFamilyReason,
+          flow_family_updated_at: familyAudit.flowFamilyUpdatedAt,
+          corrected_from_family: familyAudit.correctedFromFamily,
+          enqueued_by: familyAudit.enqueuedBy,
+          submission: {
+            promoted_profile: promotedProfile,
+            submitter_email: args.submitterEmailBase,
+            confirm_submit: args.confirmSubmit,
+          },
+          wait: undefined,
+          skip_reason_code: undefined,
+          terminal_class: undefined,
+          lease_expires_at: undefined,
+        };
+      })()
     : buildTask({
         taskId: args.taskId,
         targetUrl: args.targetUrl,
@@ -1161,6 +1380,7 @@ export async function enqueueSiteTask(args: {
         submitterEmailBase: args.submitterEmailBase,
         confirmSubmit: args.confirmSubmit,
         flowFamily: args.flowFamily,
+        enqueuedBy: args.enqueuedBy,
       });
 
   updateTaskStatus(task, "READY");
@@ -1172,6 +1392,7 @@ export async function enqueueSiteTask(args: {
 export async function claimNextTask(args: {
   owner: string;
   scope?: TaskScopeFilter;
+  lane?: ClaimLane;
 }): Promise<{
   mode: "claimed" | "idle" | "lease_held";
   task?: TaskRecord;
@@ -1179,8 +1400,10 @@ export async function claimNextTask(args: {
   reapedTaskId?: string;
 }> {
   const { reapedTaskId } = await reapExpiredQueueState();
+  const lane = args.lane ?? "active_any";
+  const leaseGroup = resolveWorkerLeaseGroupForLane(lane);
 
-  const activeLease = await loadWorkerLease();
+  const activeLease = await loadWorkerLease(leaseGroup);
   if (activeLease && new Date(activeLease.expires_at).getTime() > Date.now()) {
     return {
       mode: "lease_held",
@@ -1189,18 +1412,22 @@ export async function claimNextTask(args: {
     };
   }
 
-  const browserOwnership = await loadBrowserOwnership();
-  if (browserOwnership && new Date(browserOwnership.expires_at).getTime() > Date.now()) {
-    return {
-      mode: "lease_held",
-      lease: {
-        task_id: browserOwnership.task_id,
-        owner: browserOwnership.owner,
-        acquired_at: browserOwnership.acquired_at,
-        expires_at: browserOwnership.expires_at,
-      },
-      reapedTaskId,
-    };
+  if (leaseGroup === "active") {
+    const browserOwnership = await loadBrowserOwnership();
+    if (browserOwnership && new Date(browserOwnership.expires_at).getTime() > Date.now()) {
+      return {
+        mode: "lease_held",
+        lease: {
+          task_id: browserOwnership.task_id,
+          owner: browserOwnership.owner,
+          acquired_at: browserOwnership.acquired_at,
+          expires_at: browserOwnership.expires_at,
+          group: leaseGroup,
+          lane,
+        },
+        reapedTaskId,
+      };
+    }
   }
 
   const tasks = await listTasks();
@@ -1212,14 +1439,7 @@ export async function claimNextTask(args: {
     }
   }
 
-  const readyTasks = scopedTasks
-    .filter((task) => task.status === "READY")
-    .sort(compareByCreatedAt);
-  const retryableTasks = scopedTasks
-    .filter(canRetry)
-    .sort(compareByCreatedAt);
-
-  const nextTask = readyTasks[0] ?? retryableTasks[0];
+  const nextTask = pickNextTaskForLane(scopedTasks, lane);
   if (!nextTask) {
     return {
       mode: "idle",
@@ -1233,6 +1453,12 @@ export async function claimNextTask(args: {
     owner: args.owner,
     acquired_at: new Date(now).toISOString(),
     expires_at: new Date(now + BOUNDED_WORKER_LEASE_TTL_MS).toISOString(),
+    group: leaseGroup,
+    lane,
+    previous_status: nextTask.status,
+    previous_wait: nextTask.wait,
+    previous_terminal_class: nextTask.terminal_class,
+    previous_skip_reason_code: nextTask.skip_reason_code,
   };
 
   nextTask.run_count += 1;
@@ -1243,9 +1469,9 @@ export async function claimNextTask(args: {
   nextTask.reactivation_cooldown_until = undefined;
   nextTask.reactivation_cooldown_reason = undefined;
   nextTask.lease_expires_at = lease.expires_at;
-  nextTask.notes.push(`Claimed by ${args.owner} for a bounded worker run.`);
+  nextTask.notes.push(`Claimed by ${args.owner} for ${lane} lane run.`);
   await saveTask(nextTask);
-  await saveWorkerLease(lease);
+  await saveWorkerLease(lease, leaseGroup);
 
   return {
     mode: "claimed",

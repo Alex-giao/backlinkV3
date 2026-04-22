@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { buildRetryDecisionPlan, canRetry, isRetryExhausted, matchesTaskScope, parkExhaustedRetryableTask, shouldDeferHostReactivation, shouldReactivateRuntimeRetries, } from "./task-queue.js";
+import { buildRetryDecisionPlan, canRetry, deriveFlowFamilyAudit, deriveTaskLane, isRetryExhausted, matchesTaskScope, pickNextTaskForLane, parkExhaustedRetryableTask, resolveWorkerLeaseGroupForLane, shouldDeferHostReactivation, shouldReactivateRuntimeRetries, } from "./task-queue.js";
 function makeTask(overrides = {}) {
     return {
         id: "task-1",
@@ -32,6 +32,127 @@ function makeTask(overrides = {}) {
         ...overrides,
     };
 }
+test("deriveTaskLane routes active and waiting tasks into the expected logical lanes", () => {
+    assert.equal(deriveTaskLane(makeTask({ status: "READY", run_count: 0, flow_family: "saas_directory" })), "directory_active");
+    assert.equal(deriveTaskLane(makeTask({ status: "READY", run_count: 0, flow_family: "wp_comment" })), "non_directory_active");
+    assert.equal(deriveTaskLane(makeTask({ status: "WAITING_SITE_RESPONSE", flow_family: "saas_directory" })), "follow_up");
+    assert.equal(deriveTaskLane(makeTask({ status: "WAITING_EXTERNAL_EVENT", flow_family: "dev_blog" })), "follow_up");
+    assert.equal(deriveTaskLane(makeTask({ status: "WAITING_MANUAL_AUTH", flow_family: "wp_comment" })), undefined);
+});
+test("deriveFlowFamilyAudit records explicit and defaulted family provenance for new tasks", () => {
+    const explicit = deriveFlowFamilyAudit({
+        requestedFlowFamily: "wp_comment",
+        enqueuedBy: "dispatcher",
+        now: "2026-04-21T00:00:00.000Z",
+    });
+    assert.equal(explicit.flowFamily, "wp_comment");
+    assert.equal(explicit.flowFamilySource, "explicit");
+    assert.equal(explicit.enqueuedBy, "dispatcher");
+    const defaulted = deriveFlowFamilyAudit({
+        enqueuedBy: "dispatcher",
+        now: "2026-04-21T00:00:00.000Z",
+    });
+    assert.equal(defaulted.flowFamily, "saas_directory");
+    assert.equal(defaulted.flowFamilySource, "defaulted");
+    assert.match(defaulted.flowFamilyReason, /defaulted to saas_directory/i);
+});
+test("deriveFlowFamilyAudit records corrected_from_family when re-enqueue changes the task family", () => {
+    const corrected = deriveFlowFamilyAudit({
+        existingTask: makeTask({
+            flow_family: "saas_directory",
+            flow_family_source: "defaulted",
+            enqueued_by: "dispatcher",
+        }),
+        requestedFlowFamily: "wp_comment",
+        enqueuedBy: "hermes-follow-up",
+        now: "2026-04-21T00:00:00.000Z",
+    });
+    assert.equal(corrected.flowFamily, "wp_comment");
+    assert.equal(corrected.flowFamilySource, "corrected");
+    assert.equal(corrected.correctedFromFamily, "saas_directory");
+    assert.equal(corrected.enqueuedBy, "hermes-follow-up");
+    assert.match(corrected.flowFamilyReason, /corrected from saas_directory to wp_comment/i);
+});
+test("pickNextTaskForLane keeps waiting tasks out of the active queue and prioritizes auto-resumable email checkpoints in the follow-up queue", () => {
+    const directoryReady = makeTask({
+        id: "directory-ready",
+        status: "READY",
+        run_count: 0,
+        flow_family: "saas_directory",
+        created_at: "2026-04-08T00:00:02.000Z",
+    });
+    const nonDirectoryReady = makeTask({
+        id: "comment-ready",
+        status: "READY",
+        run_count: 0,
+        flow_family: "wp_comment",
+        created_at: "2026-04-08T00:00:03.000Z",
+    });
+    const followUpWaiting = makeTask({
+        id: "follow-up-waiting",
+        status: "WAITING_EXTERNAL_EVENT",
+        flow_family: "wp_comment",
+        created_at: "2026-04-08T00:00:01.000Z",
+        wait: {
+            wait_reason_code: "EMAIL_VERIFICATION_PENDING",
+            resume_trigger: "Check your email to verify the account.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "artifact.json",
+        },
+    });
+    const siteResponseWaiting = makeTask({
+        id: "site-response-waiting",
+        status: "WAITING_SITE_RESPONSE",
+        flow_family: "wp_comment",
+        created_at: "2026-04-08T00:00:00.000Z",
+        wait: {
+            wait_reason_code: "COMMENT_MODERATION_PENDING",
+            resume_trigger: "Comment is awaiting moderation.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "artifact.json",
+        },
+    });
+    assert.equal(pickNextTaskForLane([siteResponseWaiting, followUpWaiting, directoryReady, nonDirectoryReady], "active_any")?.id, "directory-ready");
+    assert.equal(pickNextTaskForLane([siteResponseWaiting, followUpWaiting, directoryReady, nonDirectoryReady], "non_directory_active")?.id, "comment-ready");
+    assert.equal(pickNextTaskForLane([siteResponseWaiting, followUpWaiting, directoryReady, nonDirectoryReady], "follow_up")?.id, "follow-up-waiting");
+});
+test("pickNextTaskForLane exposes lightweight site-response checkpoints to the follow-up queue when no email follow-up is pending", () => {
+    const siteResponseWaiting = makeTask({
+        id: "site-response-waiting",
+        status: "WAITING_SITE_RESPONSE",
+        flow_family: "wp_comment",
+        created_at: "2026-04-08T00:00:00.000Z",
+        wait: {
+            wait_reason_code: "COMMENT_MODERATION_PENDING",
+            resume_trigger: "Comment is awaiting moderation.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "artifact.json",
+        },
+    });
+    const unsupportedWaiting = makeTask({
+        id: "unsupported-waiting",
+        status: "WAITING_SITE_RESPONSE",
+        flow_family: "saas_directory",
+        created_at: "2026-04-08T00:00:01.000Z",
+        wait: {
+            wait_reason_code: "UNKNOWN_PENDING_REASON",
+            resume_trigger: "Wait and see.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "artifact.json",
+        },
+    });
+    assert.equal(pickNextTaskForLane([unsupportedWaiting, siteResponseWaiting], "follow_up")?.id, "site-response-waiting");
+});
+test("resolveWorkerLeaseGroupForLane keeps active work serialized while follow-up work gets its own slot", () => {
+    assert.equal(resolveWorkerLeaseGroupForLane("directory_active"), "active");
+    assert.equal(resolveWorkerLeaseGroupForLane("non_directory_active"), "active");
+    assert.equal(resolveWorkerLeaseGroupForLane("active_any"), "active");
+    assert.equal(resolveWorkerLeaseGroupForLane("follow_up"), "follow_up");
+});
 test("retryable task becomes exhausted after the automatic retry budget is used", () => {
     const task = makeTask();
     assert.equal(isRetryExhausted(task), true);

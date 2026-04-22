@@ -102,6 +102,14 @@ export type AccountAuthMode =
 
 export type FlowFamily = "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog";
 
+export type FlowFamilySource = "explicit" | "defaulted" | "carried_forward" | "corrected";
+
+export type TaskLane = "directory_active" | "non_directory_active" | "follow_up";
+
+export type ClaimLane = TaskLane | "active_any";
+
+export type WorkerLeaseGroup = "active" | "follow_up";
+
 export type LinkRelFlag = "ugc" | "sponsored" | "nofollow";
 
 export type LinkVerificationStatus = "verified_link_present" | "link_hidden" | "link_missing";
@@ -286,11 +294,28 @@ export interface TaskExecutionState {
   reusable_fragments: TaskReusableFragment[];
 }
 
+export type EmailVerificationContinuationKind = "magic_link" | "verification_code";
+
+export interface EmailVerificationContinuation {
+  kind: EmailVerificationContinuationKind;
+  source_message_id?: string;
+  source_email?: string;
+  observed_at: string;
+  suggested_target_url?: string;
+  verification_code?: string;
+  detail: string;
+}
+
 export interface TaskRecord {
   id: string;
   target_url: string;
   hostname: string;
   flow_family?: FlowFamily;
+  flow_family_source?: FlowFamilySource;
+  flow_family_reason?: string;
+  flow_family_updated_at?: string;
+  corrected_from_family?: FlowFamily;
+  enqueued_by?: string;
   submission: SubmissionContext;
   status: TaskStatus;
   created_at: string;
@@ -313,6 +338,7 @@ export interface TaskRecord {
   homepage_recovery_used?: boolean;
   visual_gate_used?: boolean;
   recovered_target_url?: string;
+  email_verification_continuation?: EmailVerificationContinuation;
   link_verification?: LinkVerificationResult;
   execution_state?: TaskExecutionState;
   phase_history: string[];
@@ -325,6 +351,12 @@ export interface WorkerLease {
   owner: string;
   acquired_at: string;
   expires_at: string;
+  group?: WorkerLeaseGroup;
+  lane?: ClaimLane;
+  previous_status?: TaskStatus;
+  previous_wait?: WaitMetadata;
+  previous_terminal_class?: TerminalClass;
+  previous_skip_reason_code?: string;
 }
 
 export interface AccountRecord {
@@ -670,6 +702,7 @@ export interface PrepareResult {
   registration_required?: boolean;
   registration_email_alias?: string;
   mailbox_query?: string;
+  email_verification_continuation?: EmailVerificationContinuation;
 }
 
 export interface MissingInputResolvedField extends MissingInputField {

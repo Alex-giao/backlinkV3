@@ -10,6 +10,7 @@ export async function runEnqueueSiteCommand(args: {
   submitterEmailBase?: string;
   confirmSubmit: boolean;
   flowFamily?: FlowFamily;
+  enqueuedBy?: string;
 }): Promise<void> {
   const task = await enqueueSiteTask(args);
   console.log(JSON.stringify(task, null, 2));

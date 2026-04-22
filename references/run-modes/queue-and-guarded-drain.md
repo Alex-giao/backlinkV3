@@ -130,6 +130,16 @@ Healthy watchdog output should focus on actual blockers:
 
 A stale lock being reaped is often a successful bounded repair, not a steady-state blocker.
 
+## Idle scope cleanup
+
+A running cron is not proof that a campaign still has runnable work.
+
+If scoped `guarded-drain-status` shows `ready=0` and `retryable_eligible_now=0`:
+- treat the scope as idle rather than as an active worker campaign
+- if the remaining inventory is only `WAITING_SITE_RESPONSE`, `WAITING_EXTERNAL_EVENT`, `WAITING_MISSING_INPUT`, `WAITING_MANUAL_AUTH`, or `WAITING_POLICY_DECISION`, do not keep empty worker/watchdog schedules spinning by default
+- preferred cleanup layer: the parent/bootstrap/manual maintenance session should pause/remove the related cron job; do not assume a cron-run child session should blindly mutate scheduling from inside its own tick
+- only keep a pure watchdog alive when the user explicitly wants passive health watch / external-event observation
+
 ## READY queue / imported-batch variation
 
 Use this variation when the user explicitly asks to run the current READY or reactivated queue for one promoted site.
@@ -276,6 +286,16 @@ Only auto-reactivate strong buckets such as:
 
 Leave the rest in triage.
 
+### Do not probe `follow-up-tick` with `--help`
+
+Observed CLI pitfall:
+- `corepack pnpm follow-up-tick -- --help` can execute a real, effectively unscoped follow-up tick instead of printing usage
+
+Operator rule:
+- do not use `--help` as a dry-run probe for this subcommand
+- if you need the accepted flags, inspect `src/cli/index.ts` / `src/cli/follow-up-tick.ts`
+- in production runs, pass the explicit scope flags (`--task-id-prefix`, `--promoted-hostname`, or `--promoted-url`) and owner directly on the first invocation
+
 ### Manual browser-use in guarded drain may need the websocket CDP URL
 
 Observed failure mode:
@@ -300,6 +320,12 @@ If either dimension is `< 100`:
 - stop the bounded worker
 - capture evidence with Playwright/CDP if needed
 - finalize as a system-owned retryable blocker rather than blaming the site
+
+Practical symptom pattern from live runs:
+- the page may still be reachable and even show visible form fields in DOM / Playwright inspection
+- but the attached shared tab can collapse to something like `innerWidth=1`, `innerHeight=1` while `outerWidth` stays non-zero
+- submit controls then produce misleading click failures such as `intercepts pointer events` or `element is outside of the viewport`
+- if you have already filled fields before noticing the collapsed viewport, do **not** reinterpret that as a real submission attempt; record that no trustworthy click/submit happened and stop cleanly
 
 Recommended outcome shape:
 - `next_status: RETRYABLE`

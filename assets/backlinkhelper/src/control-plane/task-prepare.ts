@@ -1,6 +1,7 @@
 import { acquireBrowserOwnership, releaseBrowserOwnership } from "../execution/ownership-lock.js";
 import { runTrajectoryReplay } from "../execution/replay.js";
 import { runLightweightScout } from "../execution/scout.js";
+import { classifyEarlyTerminalOutcome } from "../execution/takeover.js";
 import { getAccountForHostname } from "../memory/account-registry.js";
 import { getCredential } from "../memory/credential-vault.js";
 import {
@@ -17,7 +18,16 @@ import { resolveBrowserRuntime } from "../shared/browser-runtime.js";
 import { buildMailboxQuery, buildPlusAlias, generateSignupUsername, generateSitePassword } from "../shared/email.js";
 import { runPreflight } from "../shared/preflight.js";
 import { updateTaskExecutionStateFromOutcome, updateTaskExecutionStateFromScout } from "../shared/task-progress.js";
-import type { AccountRecord, BrowserRuntime, CredentialPayload, OpportunityClass, PrepareResult, TaskRecord, TaskStatus } from "../shared/types.js";
+import type {
+  AccountRecord,
+  BrowserRuntime,
+  CredentialPayload,
+  OpportunityClass,
+  PrepareResult,
+  ScoutResult,
+  TaskRecord,
+  TaskStatus,
+} from "../shared/types.js";
 
 function updateTaskStatus(task: TaskRecord, status: TaskStatus): void {
   task.status = status;
@@ -205,6 +215,129 @@ export function inferOpportunityClassFromScout(
   return "recovery_ambiguous";
 }
 
+function buildScoutTerminalBoundaryText(scout: ScoutResult): string {
+  const embedText = (scout.embed_hints ?? [])
+    .map((hint) =>
+      [
+        hint.provider,
+        hint.frame_title,
+        hint.frame_url,
+        hint.body_text_excerpt,
+        ...(hint.cta_candidates ?? []),
+        ...(hint.submit_candidates ?? []),
+      ]
+        .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+        .join("\n"),
+    )
+    .filter(Boolean)
+    .join("\n\n");
+
+  return [
+    scout.surface_summary,
+    scout.page_snapshot.title,
+    scout.page_snapshot.body_text_excerpt,
+    ...(scout.submit_candidates ?? []),
+    ...(scout.field_hints ?? []),
+    ...(scout.auth_hints ?? []),
+    ...(scout.anti_bot_hints ?? []),
+    embedText,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n");
+}
+
+export function classifyScoutTerminalBoundary(args: {
+  task: TaskRecord;
+  scout: ScoutResult;
+  evidenceRef: string;
+}) {
+  if (!args.scout.ok || args.scout.page_assessment?.page_reachable !== true) {
+    return undefined;
+  }
+
+  const classification = classifyEarlyTerminalOutcome({
+    currentUrl: args.scout.page_snapshot.url || args.task.target_url,
+    title: args.scout.page_snapshot.title,
+    bodyText: buildScoutTerminalBoundaryText(args.scout),
+    evidenceRef: args.evidenceRef,
+    flowFamily: args.task.flow_family,
+  });
+  const stoppableStates = new Set<TaskStatus>([
+    "SKIPPED",
+    "WAITING_POLICY_DECISION",
+    "WAITING_MANUAL_AUTH",
+    "WAITING_MISSING_INPUT",
+  ]);
+
+  if (classification.evidence_sufficiency !== "sufficient") {
+    return undefined;
+  }
+  if (classification.allow_rerun) {
+    return undefined;
+  }
+  if (!stoppableStates.has(classification.outcome.next_status)) {
+    return undefined;
+  }
+
+  return classification;
+}
+
+async function stopTaskForOutcome(args: {
+  task: TaskRecord;
+  replayHit: boolean;
+  nextStatus: TaskStatus;
+  detail: string;
+  wait?: TaskRecord["wait"];
+  terminalClass?: TaskRecord["terminal_class"];
+  skipReasonCode?: TaskRecord["skip_reason_code"];
+  evidenceRef: string;
+  scoutArtifactRef?: string;
+  scout?: PrepareResult["scout"];
+  accountCandidate?: PrepareResult["account_candidate"];
+  accountCredentials?: PrepareResult["account_credentials"];
+  registrationRequired?: boolean;
+  registrationEmailAlias?: string;
+  mailboxQuery?: string;
+}): Promise<PrepareResult> {
+  args.task.wait = args.wait;
+  args.task.terminal_class = args.terminalClass;
+  args.task.skip_reason_code = args.skipReasonCode;
+  args.task.last_takeover_outcome = args.detail;
+  if (args.nextStatus !== "RETRYABLE") {
+    args.task.email_verification_continuation = undefined;
+  }
+  args.task.notes.push(args.detail);
+  updateTaskStatus(args.task, args.nextStatus);
+  updateTaskExecutionStateFromOutcome({
+    task: args.task,
+    nextStatus: args.nextStatus,
+    detail: args.detail,
+    wait: args.wait,
+    terminalClass: args.terminalClass,
+    currentUrl: args.scout?.page_snapshot.url ?? args.task.target_url,
+    currentTitle: args.scout?.page_snapshot.title,
+    artifactRefs: [args.evidenceRef, args.scoutArtifactRef].filter((value): value is string => Boolean(value)),
+    source: "prepare",
+  });
+  await saveTask(args.task);
+  await clearWorkerLeaseForTask(args.task.id);
+
+  return {
+    mode: "task_stopped",
+    task: args.task,
+    effective_target_url: args.task.target_url,
+    replay_hit: args.replayHit,
+    scout_artifact_ref: args.scoutArtifactRef,
+    scout: args.scout,
+    account_candidate: args.accountCandidate,
+    account_credentials: args.accountCredentials,
+    registration_required: args.registrationRequired,
+    registration_email_alias: args.registrationEmailAlias,
+    mailbox_query: args.mailboxQuery,
+    email_verification_continuation: args.task.email_verification_continuation,
+  };
+}
+
 function inferPreflightFailure(args: {
   runtime: BrowserRuntime;
   stage: "task-prepare" | "task-finalize";
@@ -279,6 +412,7 @@ async function stopTaskForRetry(args: {
     registration_required: args.registrationRequired,
     registration_email_alias: args.registrationEmailAlias,
     mailbox_query: args.mailboxQuery,
+    email_verification_continuation: args.task.email_verification_continuation,
   };
 }
 
@@ -444,6 +578,26 @@ export async function prepareTaskForAgent(args: {
       artifactRef: scoutArtifactPath,
     });
 
+    const scoutTerminalBoundary = classifyScoutTerminalBoundary({
+      task,
+      scout,
+      evidenceRef: scoutArtifactPath,
+    });
+    if (scoutTerminalBoundary) {
+      return stopTaskForOutcome({
+        task,
+        replayHit: Boolean(replayPlaybook),
+        nextStatus: scoutTerminalBoundary.outcome.next_status,
+        detail: scoutTerminalBoundary.outcome.detail,
+        wait: scoutTerminalBoundary.outcome.wait,
+        terminalClass: scoutTerminalBoundary.outcome.terminal_class,
+        skipReasonCode: scoutTerminalBoundary.outcome.skip_reason_code,
+        evidenceRef: scoutArtifactPath,
+        scoutArtifactRef: scoutArtifactPath,
+        scout,
+      });
+    }
+
     let accountCandidate = await getAccountForHostname(task.hostname);
     let accountCredentials = accountCandidate?.credential_ref
       ? await getCredential(accountCandidate.credential_ref).catch(() => undefined)
@@ -502,6 +656,7 @@ export async function prepareTaskForAgent(args: {
       registration_required: registrationRequired,
       registration_email_alias: registrationEmailAlias,
       mailbox_query: mailboxQuery,
+      email_verification_continuation: task.email_verification_continuation,
     };
   } finally {
     await releaseBrowserOwnership();

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { getFamilyConfig } from "../families/index.js";
-import { deriveBusinessOutcome, summarizeBusinessOutcomes } from "./business-outcomes.js";
+import { buildBusinessOutcomeReport, deriveBusinessOutcome, summarizeBusinessOutcomes } from "./business-outcomes.js";
 import type { TaskRecord } from "./types.js";
 
 function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
@@ -141,6 +141,36 @@ test("summarizeBusinessOutcomes reports success totals and business complete rat
   assert.equal(summary.counts.submitted_success, 3);
   assert.equal(summary.counts.blocked_missing_input, 1);
   assert.equal(summary.counts.retryable_runtime_or_evidence, 1);
+});
+
+test("buildBusinessOutcomeReport exposes the four default business buckets while keeping blockers supplemental", () => {
+  const report = buildBusinessOutcomeReport([
+    makeTask({ status: "DONE" }),
+    makeTask({ id: "task-2", status: "SKIPPED" }),
+    makeTask({ id: "task-3", status: "RETRYABLE" }),
+    makeTask({ id: "task-4", status: "WAITING_SITE_RESPONSE", flow_family: "forum_profile" }),
+    makeTask({ id: "task-5", status: "READY" }),
+    makeTask({ id: "task-6", status: "RUNNING" }),
+    makeTask({ id: "task-7", status: "WAITING_MISSING_INPUT" }),
+    makeTask({ id: "task-8", status: "WAITING_POLICY_DECISION" }),
+  ]);
+
+  assert.deepEqual(report.default_view_order, [
+    "submitted_success",
+    "confirmed_dead_end",
+    "needs_rework_or_retry",
+    "untouched_ready",
+  ]);
+  assert.deepEqual(report.default_cards, [
+    { key: "submitted_success", label: "已提交成功", count: 1 },
+    { key: "confirmed_dead_end", label: "已确认死路", count: 1 },
+    { key: "needs_rework_or_retry", label: "需要修逻辑/重跑", count: 2 },
+    { key: "untouched_ready", label: "尚未开始", count: 1 },
+  ]);
+  assert.equal(report.supplemental.blocked_missing_input, 1);
+  assert.equal(report.supplemental.blocked_policy, 1);
+  assert.equal(report.supplemental.in_progress_running, 1);
+  assert.equal(report.supplemental.unknown_needs_review, 1);
 });
 
 test("deriveBusinessOutcome does not let stale wait reasons override active queue status", () => {

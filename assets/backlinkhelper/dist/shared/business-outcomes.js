@@ -9,6 +9,18 @@ const BUSINESS_OUTCOME_KEYS = [
     "retryable_runtime_or_evidence",
     "unknown_needs_review",
 ];
+const BUSINESS_DEFAULT_VIEW_ORDER = [
+    "submitted_success",
+    "confirmed_dead_end",
+    "needs_rework_or_retry",
+    "untouched_ready",
+];
+const BUSINESS_DEFAULT_VIEW_LABELS = {
+    submitted_success: "已提交成功",
+    confirmed_dead_end: "已确认死路",
+    needs_rework_or_retry: "需要修逻辑/重跑",
+    untouched_ready: "尚未开始",
+};
 function emptyCounts() {
     return Object.fromEntries(BUSINESS_OUTCOME_KEYS.map((key) => [key, 0]));
 }
@@ -71,5 +83,34 @@ export function summarizeBusinessOutcomes(tasks) {
         successful_submissions: successfulSubmissions,
         business_complete_rate: Number(businessCompleteRate.toFixed(4)),
         success_breakdown: successBreakdown,
+    };
+}
+export function buildBusinessOutcomeReport(tasks) {
+    const summary = summarizeBusinessOutcomes(tasks);
+    const overview = {
+        submitted_success: summary.successful_submissions,
+        confirmed_dead_end: summary.counts.skipped_terminal,
+        needs_rework_or_retry: summary.counts.retryable_runtime_or_evidence + summary.counts.unknown_needs_review,
+        untouched_ready: tasks.filter((task) => task.status === "READY").length,
+    };
+    return {
+        default_view_order: BUSINESS_DEFAULT_VIEW_ORDER,
+        default_cards: BUSINESS_DEFAULT_VIEW_ORDER.map((key) => ({
+            key,
+            label: BUSINESS_DEFAULT_VIEW_LABELS[key],
+            count: overview[key],
+        })),
+        overview,
+        supplemental: {
+            blocked_missing_input: summary.counts.blocked_missing_input,
+            blocked_manual_auth: summary.counts.blocked_manual_auth,
+            blocked_policy: summary.counts.blocked_policy,
+            in_progress_running: tasks.filter((task) => task.status === "RUNNING").length,
+            unknown_needs_review: summary.counts.unknown_needs_review,
+        },
+        counts: summary.counts,
+        successful_submissions: summary.successful_submissions,
+        business_complete_rate: summary.business_complete_rate,
+        success_breakdown: summary.success_breakdown,
     };
 }

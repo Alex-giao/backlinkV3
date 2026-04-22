@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   buildHomepageProbeUrl,
+  classifyScoutTerminalBoundary,
   inferOpportunityClassFromScout,
   mustRunHomepageRecoveryBeforeRetry,
   shouldProbeHomepageForSubmitRecovery,
@@ -231,4 +232,92 @@ test("field hints alone do not promote a page into deep-first without real entry
   });
 
   assert.equal(inferOpportunityClassFromScout(task, scout), "recovery_ambiguous");
+});
+
+test("scout terminal classifier front-loads paid-only submit walls", () => {
+  const task = makeTask();
+  const scout = makeScout({
+    surface_summary: "Pricing wall before submission.",
+    submit_candidates: [],
+    page_snapshot: {
+      url: "https://example.com/pricing",
+      title: "Featured listing plans",
+      response_status: 200,
+      body_text_excerpt: "Featured listing plans. Pay $49 to submit your startup for review.",
+    },
+    page_assessment: {
+      page_reachable: true,
+      visual_verification_required: false,
+      classification_confidence: "high",
+      ambiguity_flags: [],
+    },
+  });
+
+  const classification = classifyScoutTerminalBoundary({
+    task,
+    scout,
+    evidenceRef: "artifact.json",
+  });
+
+  assert.equal(classification?.outcome.next_status, "SKIPPED");
+  assert.equal(classification?.outcome.skip_reason_code, "paid_or_sponsored_listing");
+});
+
+test("scout terminal classifier front-loads existing-account login walls", () => {
+  const task = makeTask();
+  const scout = makeScout({
+    surface_summary: "Existing account login required.",
+    submit_candidates: [],
+    auth_hints: ["sign in", "password"],
+    page_snapshot: {
+      url: "https://example.com/login",
+      title: "Sign in",
+      response_status: 200,
+      body_text_excerpt: "Sign in to continue. Email Password 2FA code.",
+    },
+    page_assessment: {
+      page_reachable: true,
+      visual_verification_required: false,
+      classification_confidence: "high",
+      ambiguity_flags: [],
+    },
+  });
+
+  const classification = classifyScoutTerminalBoundary({
+    task,
+    scout,
+    evidenceRef: "artifact.json",
+  });
+
+  assert.equal(classification?.outcome.next_status, "WAITING_MANUAL_AUTH");
+  assert.equal(classification?.outcome.wait?.wait_reason_code, "DIRECTORY_LOGIN_REQUIRED");
+});
+
+test("scout terminal classifier does not front-load mixed submit/auth ambiguity", () => {
+  const task = makeTask();
+  const scout = makeScout({
+    surface_summary: "Mixed submit and auth surface.",
+    submit_candidates: ["Submit Startup"],
+    auth_hints: ["sign in", "create account"],
+    page_snapshot: {
+      url: "https://example.com/submit",
+      title: "Submit your startup",
+      response_status: 200,
+      body_text_excerpt: "Submit your startup or create account to continue. Sign in if you already have an account.",
+    },
+    page_assessment: {
+      page_reachable: true,
+      visual_verification_required: true,
+      classification_confidence: "low",
+      ambiguity_flags: ["mixed_submit_and_auth_signals", "login_vs_register_ambiguous"],
+    },
+  });
+
+  const classification = classifyScoutTerminalBoundary({
+    task,
+    scout,
+    evidenceRef: "artifact.json",
+  });
+
+  assert.equal(classification, undefined);
 });

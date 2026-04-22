@@ -13,6 +13,7 @@ import {
   runAgentDrivenBrowserUseLoop,
   shouldAttemptVisionRecovery,
   shouldRunVisualFallback,
+  validateFinalizationPageContext,
 } from "./takeover.js";
 import type { ProposedOutcome } from "../shared/types.js";
 
@@ -319,7 +320,7 @@ test("visual gate is skipped for infra failures or when visual evidence already 
   );
 });
 
-test("finalization capture prefers a same-url auth modal over the stale submit surface", () => {
+test("finalization sampling prefers visible overlay surfaces over generic body text", () => {
   const initialSample = {
     currentUrl: "https://directory.example.com/submit",
     title: "Submit your tool",
@@ -344,6 +345,31 @@ test("finalization capture prefers a same-url auth modal over the stale submit s
   });
 
   assert.deepEqual(selected, modalSample);
+});
+
+test("finalization page context rejects cross-host pages before verifier evidence is persisted", () => {
+  const validation = validateFinalizationPageContext({
+    currentUrl: "https://flickr.com/photos/example/live-comment",
+    handoffUrl: "https://vitamagazine.com/2026/feature-story/#comment-form",
+    taskHostname: "vitamagazine.com",
+  });
+
+  assert.equal(validation.ok, false);
+  assert.equal(validation.expected_hostname, "vitamagazine.com");
+  assert.equal(validation.actual_hostname, "flickr.com");
+  assert.match(validation.detail ?? "", /refusing to persist cross-host verification evidence/i);
+});
+
+test("finalization page context accepts canonical same-host pages after www normalization", () => {
+  const validation = validateFinalizationPageContext({
+    currentUrl: "https://www.designnominees.com/sites/exact-statement",
+    handoffUrl: "https://designnominees.com/sites/exact-statement",
+    taskHostname: "designnominees.com",
+  });
+
+  assert.equal(validation.ok, true);
+  assert.equal(validation.expected_hostname, "designnominees.com");
+  assert.equal(validation.actual_hostname, "designnominees.com");
 });
 
 test("signup continuation guard keeps mixed login/signup surface retryable", () => {

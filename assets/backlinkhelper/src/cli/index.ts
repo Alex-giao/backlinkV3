@@ -1,8 +1,8 @@
 import { pathToFileURL } from "node:url";
 
 import { runClaimNextTaskCommand } from "./claim-next-task.js";
-import { runEnsureOpenClawCronCommand } from "./ensure-openclaw-cron.js";
 import { runEnqueueSiteCommand } from "./enqueue-site.js";
+import { runFollowUpTickCommand } from "./follow-up-tick.js";
 import { runGuardedDrainStatusCommand } from "./guarded-drain-status.js";
 import { runInitGateCommand } from "./init-gate.js";
 import { runMailboxTriageCommand } from "./mailbox-triage.js";
@@ -36,19 +36,6 @@ function requireFlag(argv: string[], flagName: string): string {
 
 function readBooleanFlag(argv: string[], flagName: string): boolean {
   return argv.includes(flagName);
-}
-
-function readThinkingFlag(argv: string[], flagName: string): "off" | "minimal" | "low" | "medium" | "high" | "xhigh" {
-  const value = readFlag(argv, flagName);
-  if (!value) {
-    return "low";
-  }
-
-  if (["off", "minimal", "low", "medium", "high", "xhigh"].includes(value)) {
-    return value as "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
-  }
-
-  throw new Error(`Unsupported thinking level ${value}.`);
 }
 
 function readOptionalInt(argv: string[], flagName: string): number | undefined {
@@ -88,6 +75,28 @@ export function resolveTargetUrlFlag(argv: string[]): string | undefined {
   return readFlag(argv, "--target-url") ?? readFlag(argv, "--directory-url");
 }
 
+export const SUPPORTED_COMMANDS = [
+  "start-browser",
+  "preflight",
+  "enqueue-site",
+  "guarded-drain-status",
+  "mailbox-triage",
+  "follow-up-tick",
+  "missing-input-preflight",
+  "init-gate",
+  "update-promoted-dossier",
+  "claim-next-task",
+  "task-prepare",
+  "task-record-agent-trace",
+  "task-finalize",
+  "run-next",
+  "repartition-retry-decisions",
+] as const;
+
+export function buildUnknownCommandMessage(): string {
+  return `Unknown command. Use ${SUPPORTED_COMMANDS.map((command) => `"${command}"`).join(", ").replace(/, ([^,]+)$/, ", or $1")}.`;
+}
+
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
   const cdpUrl = readFlag(rest, "--cdp-url");
@@ -102,23 +111,6 @@ async function main(): Promise<void> {
     case "preflight":
       await runPreflightCommand({ cdpUrl });
       return;
-    case "ensure-openclaw-cron":
-      await runEnsureOpenClawCronCommand({
-        name: readFlag(rest, "--name") ?? "backliner-helper:queue-worker",
-        every: readFlag(rest, "--every") ?? "5m",
-        cdpUrl: cdpUrl ?? process.env.BACKLINK_BROWSER_CDP_URL ?? "http://127.0.0.1:9224",
-        timeoutSeconds: readFlag(rest, "--timeout-seconds")
-          ? Number(readFlag(rest, "--timeout-seconds"))
-          : 900,
-        thinking: readThinkingFlag(rest, "--thinking"),
-        owner: readFlag(rest, "--owner") ?? "openclaw-cron-worker",
-        model: readFlag(rest, "--model"),
-        deliver: !readBooleanFlag(rest, "--no-deliver"),
-        channel: readFlag(rest, "--channel"),
-        to: readFlag(rest, "--to"),
-        dryRun: readBooleanFlag(rest, "--dry-run"),
-      });
-      return;
     case "enqueue-site":
       await runEnqueueSiteCommand({
         taskId: requireFlag(rest, "--task-id"),
@@ -129,6 +121,7 @@ async function main(): Promise<void> {
         submitterEmailBase: readFlag(rest, "--submitter-email-base"),
         confirmSubmit: readBooleanFlag(rest, "--confirm-submit"),
         flowFamily: readFlag(rest, "--flow-family") as "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog" | undefined,
+        enqueuedBy: readFlag(rest, "--enqueued-by"),
       });
       return;
     case "guarded-drain-status":
@@ -151,6 +144,14 @@ async function main(): Promise<void> {
         maxCandidates: readFlag(rest, "--max-candidates")
           ? Number(readFlag(rest, "--max-candidates"))
           : undefined,
+      });
+      return;
+    case "follow-up-tick":
+      await runFollowUpTickCommand({
+        owner: readFlag(rest, "--owner") ?? "follow-up-worker",
+        taskIdPrefix: readFlag(rest, "--task-id-prefix"),
+        promotedHostname: readFlag(rest, "--promoted-hostname"),
+        promotedUrl: readFlag(rest, "--promoted-url"),
       });
       return;
     case "missing-input-preflight":
@@ -181,6 +182,7 @@ async function main(): Promise<void> {
     case "claim-next-task":
       await runClaimNextTaskCommand({
         owner: readFlag(rest, "--owner") ?? "codex-operator",
+        lane: readFlag(rest, "--lane") as "active_any" | "directory_active" | "non_directory_active" | "follow_up" | undefined,
         taskIdPrefix: readFlag(rest, "--task-id-prefix"),
         promotedHostname: readFlag(rest, "--promoted-hostname"),
         promotedUrl: readFlag(rest, "--promoted-url"),
@@ -231,9 +233,7 @@ async function main(): Promise<void> {
       });
       return;
     default:
-      throw new Error(
-        'Unknown command. Use "start-browser", "preflight", "ensure-openclaw-cron", "enqueue-site", "guarded-drain-status", "mailbox-triage", "missing-input-preflight", "init-gate", "update-promoted-dossier", "claim-next-task", "task-prepare", "task-record-agent-trace", "task-finalize", "run-next", or "repartition-retry-decisions".',
-      );
+      throw new Error(buildUnknownCommandMessage());
   }
 }
 

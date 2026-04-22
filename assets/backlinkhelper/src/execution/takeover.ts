@@ -125,6 +125,60 @@ interface FinalizationPageStateSample {
   surfaceFingerprint: string;
 }
 
+interface FinalizationPageContextValidation {
+  ok: boolean;
+  expected_hostname: string;
+  actual_hostname?: string;
+  detail?: string;
+}
+
+function normalizeComparableHostname(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  try {
+    return new URL(value).hostname.replace(/^www\./i, "").toLowerCase();
+  } catch {
+    return value.replace(/^www\./i, "").toLowerCase();
+  }
+}
+
+export function validateFinalizationPageContext(args: {
+  currentUrl?: string;
+  handoffUrl?: string;
+  taskHostname: string;
+}): FinalizationPageContextValidation {
+  const expectedHostname =
+    normalizeComparableHostname(args.handoffUrl) ?? normalizeComparableHostname(args.taskHostname) ?? args.taskHostname;
+  const actualHostname = normalizeComparableHostname(args.currentUrl);
+
+  if (!actualHostname) {
+    return {
+      ok: false,
+      expected_hostname: expectedHostname,
+      detail:
+        `Finalization could not confirm the active page URL for ${expectedHostname}. Refusing to persist verification evidence without a bound page context.`,
+    };
+  }
+
+  if (actualHostname === expectedHostname) {
+    return {
+      ok: true,
+      expected_hostname: expectedHostname,
+      actual_hostname: actualHostname,
+    };
+  }
+
+  return {
+    ok: false,
+    expected_hostname: expectedHostname,
+    actual_hostname: actualHostname,
+    detail:
+      `Finalization inspected ${actualHostname}, but this task is bound to ${expectedHostname}. Refusing to persist cross-host verification evidence.`,
+  };
+}
+
 type EarlyTerminalHypothesis =
   | "success_submitted"
   | "email_verification_pending_but_submitted"
@@ -2175,6 +2229,50 @@ export async function runTakeoverFinalization(args: {
           screenshotAvailable = true;
         } catch {
           screenshotAvailable = false;
+        }
+
+        const pageContextValidation = validateFinalizationPageContext({
+          currentUrl,
+          handoffUrl: args.handoff.current_url,
+          taskHostname: args.task.hostname,
+        });
+        if (!pageContextValidation.ok) {
+          const guardedOutcome = buildAmbiguousReachableRetryOutcome(
+            "FINALIZATION_PAGE_CONTEXT_MISMATCH",
+            pageContextValidation.detail ??
+              "Finalization lost the task-bound page context and refused to persist cross-host evidence.",
+            artifactPath,
+          );
+          await writeJsonFile(artifactPath, {
+            stage: "finalization",
+            target_url: args.task.target_url,
+            current_url: currentUrl,
+            title,
+            body_excerpt: bodyText.slice(0, 2_000),
+            visible_surface_excerpt: pageState.visibleSurfaceText.slice(0, 1_000),
+            visible_overlay_surface_detected: pageState.hasVisibleOverlaySurface,
+            page_context_validation: pageContextValidation,
+            recorded_steps: args.handoff.recorded_steps,
+            proposed_outcome: args.handoff.proposed_outcome,
+            final_outcome: guardedOutcome,
+            visual_verification: args.handoff.visual_verification,
+            vision_recovery_attempts: args.handoff.vision_recovery_attempts,
+            agent_trace_ref: args.handoff.agent_trace_ref,
+            agent_backend: args.handoff.agent_backend,
+            agent_steps_count: args.handoff.agent_steps_count,
+          });
+
+          return {
+            ok: false,
+            next_status: guardedOutcome.next_status,
+            detail: guardedOutcome.detail,
+            artifact_refs: [artifactPath, screenshotPath],
+            wait: guardedOutcome.wait,
+            terminal_class: guardedOutcome.terminal_class,
+            agent_trace_ref: args.handoff.agent_trace_ref,
+            agent_backend: args.handoff.agent_backend,
+            agent_steps_count: args.handoff.agent_steps_count,
+          };
         }
 
         const linkVerification = await verifyLinkOnPage({

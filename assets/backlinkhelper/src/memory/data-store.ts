@@ -7,6 +7,7 @@ import type {
   CredentialVaultRecord,
   TaskRecord,
   WorkerLease,
+  WorkerLeaseGroup,
 } from "../shared/types.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -77,8 +78,12 @@ export function getOwnershipLockPath(): string {
   return path.join(DATA_DIRECTORIES.runtime, "browser-ownership-lock.json");
 }
 
-export function getWorkerLeasePath(): string {
-  return path.join(DATA_DIRECTORIES.runtime, "task-worker-lease.json");
+export const WORKER_LEASE_GROUPS: WorkerLeaseGroup[] = ["active", "follow_up"];
+
+export function getWorkerLeasePath(group: WorkerLeaseGroup = "active"): string {
+  return group === "active"
+    ? path.join(DATA_DIRECTORIES.runtime, "task-worker-lease.json")
+    : path.join(DATA_DIRECTORIES.runtime, `task-worker-lease-${group}.json`);
 }
 
 export function getPendingFinalizePath(taskId: string): string {
@@ -125,16 +130,27 @@ export async function listTasks(): Promise<TaskRecord[]> {
   return tasks.filter((task): task is TaskRecord => Boolean(task));
 }
 
-export async function loadWorkerLease(): Promise<WorkerLease | undefined> {
-  return readJsonFile<WorkerLease>(getWorkerLeasePath());
+export async function loadWorkerLease(group: WorkerLeaseGroup = "active"): Promise<WorkerLease | undefined> {
+  return readJsonFile<WorkerLease>(getWorkerLeasePath(group));
 }
 
-export async function saveWorkerLease(lease: WorkerLease): Promise<void> {
-  await writeJsonFile(getWorkerLeasePath(), lease);
+export async function loadAllWorkerLeases(): Promise<Record<WorkerLeaseGroup, WorkerLease | undefined>> {
+  const leases = await Promise.all(WORKER_LEASE_GROUPS.map(async (group) => [group, await loadWorkerLease(group)] as const));
+  return Object.fromEntries(leases) as Record<WorkerLeaseGroup, WorkerLease | undefined>;
 }
 
-export async function clearWorkerLease(): Promise<void> {
-  const leasePath = getWorkerLeasePath();
+export async function saveWorkerLease(
+  lease: WorkerLease,
+  group: WorkerLeaseGroup = lease.group ?? "active",
+): Promise<void> {
+  await writeJsonFile(getWorkerLeasePath(group), {
+    ...lease,
+    group,
+  } satisfies WorkerLease);
+}
+
+export async function clearWorkerLease(group: WorkerLeaseGroup = "active"): Promise<void> {
+  const leasePath = getWorkerLeasePath(group);
   try {
     await unlink(leasePath);
   } catch (error) {
@@ -146,13 +162,18 @@ export async function clearWorkerLease(): Promise<void> {
 }
 
 export async function clearWorkerLeaseForTask(taskId: string): Promise<boolean> {
-  const existingLease = await loadWorkerLease();
-  if (!existingLease || existingLease.task_id !== taskId) {
-    return false;
+  let cleared = false;
+  for (const group of WORKER_LEASE_GROUPS) {
+    const existingLease = await loadWorkerLease(group);
+    if (!existingLease || existingLease.task_id !== taskId) {
+      continue;
+    }
+
+    await clearWorkerLease(group);
+    cleared = true;
   }
 
-  await clearWorkerLease();
-  return true;
+  return cleared;
 }
 
 export async function clearPendingFinalize(taskId: string): Promise<void> {

@@ -14,6 +14,7 @@ export async function runClaimNextTaskCommand(args) {
     }
     const result = await claimNextTask({
         owner: args.owner,
+        lane: args.lane,
         scope: {
             taskIdPrefix: args.taskIdPrefix,
             promotedHostname: args.promotedHostname,

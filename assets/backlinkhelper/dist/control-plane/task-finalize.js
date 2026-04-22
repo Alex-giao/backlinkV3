@@ -35,6 +35,25 @@ function inferPreflightFailure(runtime) {
         detail: "task-finalize stopped because the runtime preflight failed unexpectedly.",
     };
 }
+export function applyFinalizeResultToTask(args) {
+    const { task, finalResult, handoff } = args;
+    task.wait = finalResult.wait;
+    task.status = finalResult.next_status;
+    task.updated_at = new Date().toISOString();
+    task.terminal_class = finalResult.terminal_class;
+    task.skip_reason_code = finalResult.skip_reason_code;
+    task.last_takeover_outcome = finalResult.detail;
+    task.link_verification = finalResult.link_verification;
+    if (finalResult.next_status !== "RETRYABLE") {
+        task.email_verification_continuation = undefined;
+    }
+    task.lease_expires_at = undefined;
+    task.visual_gate_used = Boolean(handoff.visual_verification);
+    appendUnique(task.latest_artifacts, [...handoff.artifact_refs, ...finalResult.artifact_refs]);
+    task.notes.push(finalResult.detail);
+    task.wait = enrichWaitMetadataWithMissingFields(task).wait;
+    finalResult.wait = task.wait;
+}
 export async function finalizeTask(args) {
     await ensureDataDirectories();
     const task = await loadTask(args.taskId);
@@ -69,6 +88,7 @@ export async function finalizeTask(args) {
         task.updated_at = new Date().toISOString();
         task.terminal_class = retryResult.terminal_class;
         task.last_takeover_outcome = retryResult.detail;
+        task.link_verification = undefined;
         task.lease_expires_at = undefined;
         task.notes.push(retryResult.detail);
         updateTaskExecutionStateFromOutcome({
@@ -111,22 +131,11 @@ export async function finalizeTask(args) {
             }
         }
     }
-    task.wait = finalResult.wait;
-    task.status = finalResult.next_status;
-    task.updated_at = new Date().toISOString();
-    task.terminal_class = finalResult.terminal_class;
-    task.skip_reason_code = finalResult.skip_reason_code;
-    task.last_takeover_outcome = finalResult.detail;
-    task.link_verification = finalResult.link_verification ?? task.link_verification;
-    task.lease_expires_at = undefined;
-    task.visual_gate_used = Boolean(pendingFinalize.handoff.visual_verification);
-    appendUnique(task.latest_artifacts, [
-        ...pendingFinalize.handoff.artifact_refs,
-        ...finalResult.artifact_refs,
-    ]);
-    task.notes.push(finalResult.detail);
-    task.wait = enrichWaitMetadataWithMissingFields(task).wait;
-    finalResult.wait = task.wait;
+    applyFinalizeResultToTask({
+        task,
+        finalResult,
+        handoff: pendingFinalize.handoff,
+    });
     updateTaskExecutionStateFromFinalize({
         task,
         result: finalResult,

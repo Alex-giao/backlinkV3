@@ -112,31 +112,9 @@ pnpm preflight
 - 当前生产主路径**不要求** `OPENAI_API_KEY`。
 - 邮件读取主路径优先 `gog`，但当前也支持 `gws`（google-workspace skill）作为低成本兜底；两者任一完成 Gmail 授权即可支撑邮箱验证码 / magic link 场景。
 
-### 2.1 历史兼容入口：`ensure-openclaw-cron`
+### 2.1 长跑 orchestration worker（可选）
 
-当前推荐口径是：直接用 Hermes / V3 operator 运行主链。  
-下面这个命令只在你仍要兼容旧调度环境时才需要：
-
-```bash
-cd <repo-root>
-corepack pnpm ensure-openclaw-cron -- \
-  --every 5m \
-  --cdp-url http://127.0.0.1:9224
-```
-
-说明：
-
-- 这条命令会把旧 cron 配置当成 **历史兼容运行时配置** 来对账：
-  - 不存在就创建
-  - 已存在就更新到当前推荐 spec
-- 默认 job 名：`backliner-helper:queue-worker`
-- 默认使用 isolated `agentTurn`
-- 默认 cadence：`5m`
-- 默认输出策略：
-  - 空队列 / 正常自动恢复 / 正常提交完成 → `NO_REPLY`
-  - 只有真的需要人工介入时才发 blocker 提醒
-- 如需静默安装，可追加：`--no-deliver`
-- 如果当前瓶颈不是“没有人 claim”，而是短 cron 本身带来过多空转/重复回灌，可用长跑 orchestration worker 减少调度开销；但它不应替代单任务 operator judgment，也不应把站点入口发现/点击/提交流程固化进 source-only tmp helper。
+如果当前瓶颈不是“没有人 claim”，而是短轮询本身带来过多空转/重复回灌，可用长跑 orchestration worker 减少调度开销；但它不应替代单任务 operator judgment，也不应把站点入口发现/点击/提交流程固化进 source-only tmp helper。
 
 ```bash
 corepack pnpm drain-worker -- \
@@ -276,9 +254,8 @@ pnpm diff-skills
   - 注册型站点的邮箱 alias 策略
 - 当前 repo 还没有完全自动化：
   - 独立 watchdog 进程
-  - 通用 Hermes / 外部调度接入（当前仅保留 `ensure-openclaw-cron` 旧兼容入口）
   - 通用 OAuth worker
   - 完整的 `gog` 自动恢复 runner
 - 所以当前最准确的定位是：
   - **repo = 可调度的执行底座**
-  - **operator skill = 真正的运行入口**
+  - **operator skill / Hermes Agent = 真正的运行入口**

@@ -28,6 +28,8 @@
 ### 1. 默认优先顺序
 - 当前 brief 明确指定的邮箱资源
 - 已接好的 Google Workspace / Gmail 能力
+- 正式开跑前默认要求同时具备：一个主 submitter 邮箱资源 + 一个用户明确提供的 Gmail backup 邮箱资源
+- 若当前 batch / queue 可能触发注册验证，而 dossier / brief 中没有 Gmail backup 邮箱：先 ask user once，拿到后再开跑；不要等卡在收信阶段才临时追问
 - 站点要求触发后再决定是否切换 alias，而不是一开始乱换
 
 ### 2. 何时考虑切 Gmail alias
@@ -36,10 +38,19 @@
 - 站点疑似对某类自定义域邮箱 deliverability 很差
 - campaign 允许用通用 submitter identity，而不是必须品牌域邮箱
 
+默认切换规则：
+- 若站点已向自定义域邮箱发起验证链路，应先做一次 resend（如果页面提供）
+- resend 后，用 authoritative Gmail / mailbox exact query 再确认一次
+- 若在默认首轮 2 分钟观察窗内仍收不到验证邮件，优先把该站点视为“域名邮箱 deliverability 可疑”
+- 这时若用户已提供 Gmail backup 邮箱，优先改用该 Gmail 身份从干净注册路径重做，不再在同一个域名邮箱上反复空等
+- 这里的 2 分钟是默认运营阈值，不是全局不可覆盖的核心硬门禁；若某类站点已知发信更慢，可由 brief / runtime 覆盖；bundled runtime 当前使用 `BACKLINK_EMAIL_FALLBACK_WAIT_SECONDS`（默认 120）作为这个窗口
+- operator-only 路径下，`task-prepare` 现在会同时暴露主注册草稿与 Gmail fallback 注册草稿；若页面明确拒绝自定义域邮箱或超时未收信，应优先切到 prepare 输出里的 Gmail fallback 凭据，而不是临时现场造新身份
+
 注意：
 - 切邮箱不等于伪造身份
 - 仍然要保持 submitter identity 自洽、可回溯
 - alias 变化要写回 repo state，避免下次失忆
+- 若站点明确不接受自定义域名邮箱，也应直接切到用户提供的 Gmail backup，而不是继续重试域名邮箱
 
 ### 3. 查邮箱时不要丢表单页
 - 当前页已经填了一半时，不要为了查邮件主动离开原表单

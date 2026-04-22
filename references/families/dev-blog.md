@@ -14,10 +14,11 @@
 - 公开页链接与 rel 实测
 
 状态判断：
-- `draft saved` = `ARTICLE_DRAFT_SAVED`，表示可恢复进度，不是成功
+- `draft saved` = `ARTICLE_DRAFT_SAVED`，表示只是保存草稿，不是成功
 - `submitted for review / article submitted` = `ARTICLE_SUBMITTED_PENDING_EDITORIAL`，表示站点在审核，不是成功
 - `published` 只有在 link verification 命中目标链接时才算成功
 - `published` 但没有目标链接，应记为 `ARTICLE_PUBLISHED_NO_LINK`
+- 对 `ARTICLE_PUBLISHED_NO_LINK`，默认应直接按终态失败收口（skip / terminal audit），不要再做无人值守自动重试；文章已经公开但链接没落地时，重复自动提交通常没有意义
 
 首版资料字段 bundle：
 - article_title

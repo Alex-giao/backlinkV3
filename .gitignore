@@ -4,6 +4,10 @@ assets/backlinkhelper/data/backlink-helper/
 # Dependencies
 assets/backlinkhelper/node_modules/
 
+# Local temp helpers / scratch runs
+assets/backlinkhelper/tmp/
+assets/backlinkhelper/tmp-*.mjs
+
 # Common local noise
 .DS_Store
 *.log

@@ -50,8 +50,11 @@ export function getArtifactFilePath(taskId, artifactName) {
 export function getOwnershipLockPath() {
     return path.join(DATA_DIRECTORIES.runtime, "browser-ownership-lock.json");
 }
-export function getWorkerLeasePath() {
-    return path.join(DATA_DIRECTORIES.runtime, "task-worker-lease.json");
+export const WORKER_LEASE_GROUPS = ["active", "follow_up"];
+export function getWorkerLeasePath(group = "active") {
+    return group === "active"
+        ? path.join(DATA_DIRECTORIES.runtime, "task-worker-lease.json")
+        : path.join(DATA_DIRECTORIES.runtime, `task-worker-lease-${group}.json`);
 }
 export function getPendingFinalizePath(taskId) {
     return path.join(DATA_DIRECTORIES.runtime, `${taskId}-pending-finalize.json`);
@@ -85,14 +88,21 @@ export async function listTasks() {
         .map((entry) => readJsonFile(path.join(DATA_DIRECTORIES.tasks, entry.name))));
     return tasks.filter((task) => Boolean(task));
 }
-export async function loadWorkerLease() {
-    return readJsonFile(getWorkerLeasePath());
+export async function loadWorkerLease(group = "active") {
+    return readJsonFile(getWorkerLeasePath(group));
 }
-export async function saveWorkerLease(lease) {
-    await writeJsonFile(getWorkerLeasePath(), lease);
+export async function loadAllWorkerLeases() {
+    const leases = await Promise.all(WORKER_LEASE_GROUPS.map(async (group) => [group, await loadWorkerLease(group)]));
+    return Object.fromEntries(leases);
 }
-export async function clearWorkerLease() {
-    const leasePath = getWorkerLeasePath();
+export async function saveWorkerLease(lease, group = lease.group ?? "active") {
+    await writeJsonFile(getWorkerLeasePath(group), {
+        ...lease,
+        group,
+    });
+}
+export async function clearWorkerLease(group = "active") {
+    const leasePath = getWorkerLeasePath(group);
     try {
         await unlink(leasePath);
     }
@@ -104,12 +114,16 @@ export async function clearWorkerLease() {
     }
 }
 export async function clearWorkerLeaseForTask(taskId) {
-    const existingLease = await loadWorkerLease();
-    if (!existingLease || existingLease.task_id !== taskId) {
-        return false;
+    let cleared = false;
+    for (const group of WORKER_LEASE_GROUPS) {
+        const existingLease = await loadWorkerLease(group);
+        if (!existingLease || existingLease.task_id !== taskId) {
+            continue;
+        }
+        await clearWorkerLease(group);
+        cleared = true;
     }
-    await clearWorkerLease();
-    return true;
+    return cleared;
 }
 export async function clearPendingFinalize(taskId) {
     try {

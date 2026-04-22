@@ -1,17 +1,9 @@
 import { loadBrowserOwnership } from "../execution/ownership-lock.js";
-import { listTasks, loadWorkerLease } from "../memory/data-store.js";
-import { canRetry, matchesTaskScope, reapExpiredQueueState } from "../control-plane/task-queue.js";
+import { listTasks, loadAllWorkerLeases, readJsonFile } from "../memory/data-store.js";
+import { buildTaskLaneReport, canRetry, matchesTaskScope, reapExpiredQueueState } from "../control-plane/task-queue.js";
 import { probeRuntimeHealth } from "../shared/runtime-health.js";
-import { summarizeBusinessOutcomes } from "../shared/business-outcomes.js";
-export async function runGuardedDrainStatusCommand(args) {
-    const scope = {
-        taskIdPrefix: args.taskIdPrefix,
-        promotedHostname: args.promotedHostname,
-        promotedUrl: args.promotedUrl,
-    };
-    const repair = await reapExpiredQueueState();
-    const runtimeHealth = await probeRuntimeHealth(args.cdpUrl);
-    const tasks = (await listTasks()).filter((task) => matchesTaskScope(task, scope));
+import { buildBusinessOutcomeReport } from "../shared/business-outcomes.js";
+function buildSystemStatusReport(tasks) {
     const statusCounts = {};
     const waitReasonCounts = {};
     for (const task of tasks) {
@@ -21,7 +13,6 @@ export async function runGuardedDrainStatusCommand(args) {
             waitReasonCounts[waitReason] = (waitReasonCounts[waitReason] ?? 0) + 1;
         }
     }
-    const businessOutcomes = summarizeBusinessOutcomes(tasks);
     const waitReasonTop = Object.entries(waitReasonCounts)
         .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
         .slice(0, 10)
@@ -36,21 +27,7 @@ export async function runGuardedDrainStatusCommand(args) {
         .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
         .slice(0, 10)
         .map(([hostname, count]) => ({ hostname, count }));
-    const activeLease = await loadWorkerLease();
-    const browserOwnership = await loadBrowserOwnership();
-    const blockers = [];
-    if (!runtimeHealth.healthy) {
-        blockers.push(runtimeHealth.summary);
-    }
-    console.log(JSON.stringify({
-        ok: blockers.length === 0,
-        scope,
-        runtime_health: runtimeHealth,
-        repair,
-        active_lease: activeLease && new Date(activeLease.expires_at).getTime() > Date.now() ? activeLease : undefined,
-        browser_ownership: browserOwnership && new Date(browserOwnership.expires_at).getTime() > Date.now()
-            ? browserOwnership
-            : undefined,
+    return {
         totals: {
             tasks: tasks.length,
             ready: tasks.filter((task) => task.status === "READY").length,
@@ -60,14 +37,112 @@ export async function runGuardedDrainStatusCommand(args) {
             waiting_site_response: tasks.filter((task) => task.status === "WAITING_SITE_RESPONSE").length,
             reactivation_cooldown: tasks.filter((task) => task.wait?.wait_reason_code === "REACTIVATION_COOLDOWN").length,
             repeated_failure_review: tasks.filter((task) => task.wait?.wait_reason_code === "REPEATED_FAILURE_REVIEW_REQUIRED").length,
-            successful_submissions: businessOutcomes.successful_submissions,
-            business_complete_rate: businessOutcomes.business_complete_rate,
         },
         status_counts: statusCounts,
-        business_outcome_counts: businessOutcomes.counts,
-        success_breakdown: businessOutcomes.success_breakdown,
         wait_reason_top: waitReasonTop,
         repeat_failure_host_top: repeatFailureHostTop,
+    };
+}
+function emptyFollowUpOutcomeReport() {
+    return {
+        totals: {
+            magic_link_ready: 0,
+            verification_code_ready: 0,
+            site_response_verified: 0,
+            site_response_still_waiting: 0,
+        },
+    };
+}
+export function buildFollowUpOutcomeReport(snapshots) {
+    const report = emptyFollowUpOutcomeReport();
+    for (const snapshot of snapshots) {
+        if (snapshot.previous_status === "WAITING_EXTERNAL_EVENT" && snapshot.evaluation?.action === "activate_ready") {
+            if (snapshot.evaluation.continuation?.kind === "magic_link") {
+                report.totals.magic_link_ready += 1;
+            }
+            else if (snapshot.evaluation.continuation?.kind === "verification_code") {
+                report.totals.verification_code_ready += 1;
+            }
+            continue;
+        }
+        if (snapshot.previous_status === "WAITING_SITE_RESPONSE") {
+            if (snapshot.evaluation?.action === "complete_done") {
+                report.totals.site_response_verified += 1;
+            }
+            else if (snapshot.evaluation?.action === "restore_waiting" &&
+                snapshot.evaluation.linkVerification?.verification_status === "link_missing") {
+                report.totals.site_response_still_waiting += 1;
+            }
+        }
+    }
+    return report;
+}
+async function loadLatestFollowUpSnapshots(tasks) {
+    const snapshots = [];
+    for (const task of tasks) {
+        const artifactPath = [...task.latest_artifacts].reverse().find((entry) => entry.includes("follow-up"));
+        if (!artifactPath) {
+            continue;
+        }
+        const artifact = await readJsonFile(artifactPath);
+        if (!artifact || artifact.stage !== "follow_up") {
+            continue;
+        }
+        snapshots.push({
+            previous_status: artifact.previous_status,
+            evaluation: artifact.evaluation,
+        });
+    }
+    return snapshots;
+}
+export function buildGuardedDrainStatusPayload(args) {
+    return {
+        ok: args.blockers.length === 0,
+        scope: args.scope,
+        runtime_health: args.runtimeHealth,
+        repair: args.repair,
+        report_default_view: "business_outcome",
+        business_report: buildBusinessOutcomeReport(args.tasks),
+        lane_report: buildTaskLaneReport(args.tasks),
+        follow_up_report: args.followUpReport,
+        system_status_report: buildSystemStatusReport(args.tasks),
+        worker_leases: {
+            active: args.activeLease,
+            follow_up: args.followUpLease,
+        },
+        browser_ownership: args.browserOwnership,
+        blockers: args.blockers,
+    };
+}
+export async function runGuardedDrainStatusCommand(args) {
+    const scope = {
+        taskIdPrefix: args.taskIdPrefix,
+        promotedHostname: args.promotedHostname,
+        promotedUrl: args.promotedUrl,
+    };
+    const repair = await reapExpiredQueueState();
+    const runtimeHealth = await probeRuntimeHealth(args.cdpUrl);
+    const tasks = (await listTasks()).filter((task) => matchesTaskScope(task, scope));
+    const followUpSnapshots = await loadLatestFollowUpSnapshots(tasks);
+    const workerLeases = await loadAllWorkerLeases();
+    const browserOwnership = await loadBrowserOwnership();
+    const blockers = [];
+    if (!runtimeHealth.healthy) {
+        blockers.push(runtimeHealth.summary);
+    }
+    const isLiveLease = (lease) => Boolean(lease && new Date(lease.expires_at).getTime() > Date.now());
+    const payload = buildGuardedDrainStatusPayload({
+        scope,
+        runtimeHealth,
+        repair,
+        tasks,
+        activeLease: isLiveLease(workerLeases.active) ? workerLeases.active : undefined,
+        followUpLease: isLiveLease(workerLeases.follow_up) ? workerLeases.follow_up : undefined,
+        followUpReport: buildFollowUpOutcomeReport(followUpSnapshots),
+        browserOwnership: browserOwnership && new Date(browserOwnership.expires_at).getTime() > Date.now()
+            ? browserOwnership
+            : undefined,
         blockers,
-    }, null, 2));
+    });
+    console.log(JSON.stringify(payload, null, 2));
 }
