@@ -2,6 +2,13 @@ import { chromium } from "playwright";
 import { describeBrowserUseLookup, resolveBrowserUseBin } from "./browser-use-bin.js";
 import { runCommand } from "./command.js";
 import { detectMailProvider } from "./gog.js";
+function extractBrowserDebuggerId(webSocketDebuggerUrl) {
+    if (!webSocketDebuggerUrl) {
+        return undefined;
+    }
+    const match = webSocketDebuggerUrl.match(/\/devtools\/browser\/([^/?#]+)/);
+    return match?.[1];
+}
 async function probeCdpVersion(cdpUrl) {
     try {
         const response = await fetch(new URL("/json/version", cdpUrl), {
@@ -17,6 +24,7 @@ async function probeCdpVersion(cdpUrl) {
         return {
             ok: true,
             browser_name: payload.Browser,
+            browser_id: extractBrowserDebuggerId(payload.webSocketDebuggerUrl),
         };
     }
     catch (error) {
@@ -46,8 +54,17 @@ async function getLoopbackConflictHint(cdpUrl) {
     if (!alternateUrl) {
         return "";
     }
-    const alternateProbe = await probeCdpVersion(alternateUrl);
+    const [primaryProbe, alternateProbe] = await Promise.all([
+        probeCdpVersion(cdpUrl),
+        probeCdpVersion(alternateUrl),
+    ]);
     if (!alternateProbe.ok) {
+        return "";
+    }
+    if (primaryProbe.ok &&
+        primaryProbe.browser_id &&
+        alternateProbe.browser_id &&
+        primaryProbe.browser_id === alternateProbe.browser_id) {
         return "";
     }
     return ` The alternate loopback host ${alternateUrl} responded as ${alternateProbe.browser_name ?? "a DevTools endpoint"}. Another browser instance is likely occupying one loopback listener. Use ${alternateUrl} directly or restart on a clean port.`;
@@ -92,7 +109,13 @@ async function checkBrowserUseCli() {
         detail: `browser-use CLI detected at ${result.stdout.trim()}.`,
     };
 }
-async function checkPlaywright(cdpUrl) {
+export async function checkPlaywright(cdpUrl, options = {}) {
+    if (options.mode === "skip") {
+        return {
+            ok: true,
+            detail: "Skipped full Playwright attach check in light preflight mode.",
+        };
+    }
     try {
         const browser = await chromium.connectOverCDP(cdpUrl);
         const context = browser.contexts()[0] ?? (await browser.newContext());
@@ -125,9 +148,11 @@ async function checkAgentBackend() {
         detail: "Operator-only mode: repo-native OpenAI agent backend is disabled. Use Codex/OpenClaw operator flow (claim-next-task -> task-prepare -> task-record-agent-trace -> task-finalize).",
     };
 }
-export async function runPreflight(runtime) {
+export async function runPreflight(runtime, options = {}) {
     const cdp_runtime = await checkCdpRuntime(runtime.cdp_url);
-    const playwright = await checkPlaywright(runtime.cdp_url);
+    const playwright = await checkPlaywright(runtime.cdp_url, {
+        mode: options.mode === "light" ? "skip" : "full",
+    });
     const browser_use_cli = await checkBrowserUseCli();
     const agent_backend = await checkAgentBackend();
     const gog = await checkGog();

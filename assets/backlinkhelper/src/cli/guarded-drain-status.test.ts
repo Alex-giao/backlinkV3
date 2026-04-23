@@ -188,4 +188,58 @@ test("guarded drain payload defaults to business outcome view, exposes lane coun
     WAITING_SITE_RESPONSE: 1,
     WAITING_RETRY_DECISION: 1,
   });
+  assert.equal(payload.runtime_observability.circuit_breaker_open, false);
+});
+
+test("guarded drain payload surfaces runtime observability for breaker, browser pollution, and last auto-recovery attempt", () => {
+  const payload = buildGuardedDrainStatusPayload({
+    scope: {},
+    runtimeHealth: {
+      healthy: false,
+      summary: "runtime unhealthy",
+      browser_state: {
+        ok: true,
+        detail: "Shared browser retains 4 regular pages; suspect retained regular pages / target pollution.",
+        total_targets: 9,
+        page_targets: 5,
+        regular_page_targets: 4,
+        suspicious: true,
+      },
+      runtime_incident: {
+        kind: "PLAYWRIGHT_CDP_UNAVAILABLE",
+        source: "task-prepare",
+        detail: "polluted browser",
+        opened_at: "2026-04-23T01:00:00.000Z",
+        updated_at: "2026-04-23T01:05:00.000Z",
+      },
+      recovery_status: {
+        last_attempt: {
+          attempted_at: "2026-04-23T01:06:00.000Z",
+          incident_kind: "PLAYWRIGHT_CDP_UNAVAILABLE",
+          recovered: false,
+          detail: "Skip sanitize: active worker lease still held by active-worker for task task-3.",
+          sanitized_targets: 0,
+        },
+        recent_attempts: [
+          {
+            attempted_at: "2026-04-23T01:06:00.000Z",
+            incident_kind: "PLAYWRIGHT_CDP_UNAVAILABLE",
+            recovered: false,
+            detail: "Skip sanitize: active worker lease still held by active-worker for task task-3.",
+            sanitized_targets: 0,
+          },
+        ],
+      },
+    },
+    repair: { repaired: 0 },
+    tasks: [],
+    followUpReport: buildFollowUpOutcomeReport([]),
+    blockers: ["runtime unhealthy"],
+  });
+
+  assert.equal(payload.runtime_observability.circuit_breaker_open, true);
+  assert.equal(payload.runtime_observability.incident?.kind, "PLAYWRIGHT_CDP_UNAVAILABLE");
+  assert.equal(payload.runtime_observability.browser_target_health?.regular_page_targets, 4);
+  assert.equal(payload.runtime_observability.last_recovery_attempt?.recovered, false);
+  assert.equal(payload.runtime_observability.recent_recovery_attempts.length, 1);
 });

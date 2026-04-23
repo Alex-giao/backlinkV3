@@ -3,6 +3,8 @@ import { getFamilyConfig, resolveFlowFamily } from "../families/index.js";
 import { buildTargetPreflightAssessment, findExactHostDuplicateTasks } from "./target-preflight.js";
 import { clearPendingFinalize, clearWorkerLease, ensureDataDirectories, listTasks, loadTask, loadWorkerLease, readJsonFile, saveTask, saveWorkerLease, } from "../memory/data-store.js";
 import { loadBrowserOwnership, reapExpiredBrowserOwnership } from "../execution/ownership-lock.js";
+import { loadRuntimeIncident } from "../shared/runtime-incident.js";
+import { tryAutoRecoverRuntimeIncident } from "../shared/runtime-sanitize.js";
 import { BOUNDED_WORKER_LEASE_TTL_MS } from "../shared/runtime-budgets.js";
 import { markTaskStageTimestamp } from "../shared/task-timing.js";
 const RETRY_BACKOFF_MS = 60 * 60 * 1_000;
@@ -21,6 +23,13 @@ const GENERIC_WAIT_REASON_CODES = new Set([
     RETRY_EXHAUSTED_WAIT_REASON_CODE,
     RETRY_CLASSIFICATION_PENDING_WAIT_REASON_CODE,
 ]);
+export let __testTryAutoRecoverRuntimeIncident = tryAutoRecoverRuntimeIncident;
+export function __setRuntimeRecoveryHookForTest(hook) {
+    __testTryAutoRecoverRuntimeIncident = hook;
+}
+export function __resetRuntimeRecoveryHookForTest() {
+    __testTryAutoRecoverRuntimeIncident = tryAutoRecoverRuntimeIncident;
+}
 const COMMUNITY_HOST_PATTERNS = [
     "reddit.com",
     "github.com",
@@ -1340,6 +1349,17 @@ export async function claimNextTask(args) {
                     lane,
                 },
                 reapedTaskId,
+            };
+        }
+    }
+    const runtimeIncident = await loadRuntimeIncident();
+    if (runtimeIncident) {
+        const recovery = await __testTryAutoRecoverRuntimeIncident(runtimeIncident.cdp_url);
+        if (!recovery.recovered) {
+            return {
+                mode: "idle",
+                reapedTaskId,
+                runtime_incident: runtimeIncident,
             };
         }
     }

@@ -9,6 +9,7 @@ import { loadTrajectoryPlaybook } from "../memory/trajectory-playbook.js";
 import { resolveBrowserRuntime } from "../shared/browser-runtime.js";
 import { buildMailboxQuery, buildPlusAlias, generateSignupUsername, generateSitePassword } from "../shared/email.js";
 import { runPreflight } from "../shared/preflight.js";
+import { openRuntimeIncident } from "../shared/runtime-incident.js";
 import { updateTaskExecutionStateFromOutcome, updateTaskExecutionStateFromScout } from "../shared/task-progress.js";
 import { markTaskStageTimestamp } from "../shared/task-timing.js";
 function updateTaskStatus(task, status) {
@@ -60,6 +61,9 @@ function buildRegistrationDraft(task) {
 }
 function inferScoutFailureReason(scout) {
     const summary = scout?.surface_summary?.toLowerCase() ?? "";
+    if (summary.includes("connectovercdp") || summary.includes("playwright could not connect")) {
+        return "PLAYWRIGHT_CDP_UNAVAILABLE";
+    }
     if (summary.includes("timed out")) {
         return "SCOUT_SESSION_TIMEOUT";
     }
@@ -278,6 +282,20 @@ function inferPreflightFailure(args) {
         detail: `${args.stage} stopped because the runtime preflight failed unexpectedly.`,
     };
 }
+async function recordRuntimeIncidentIfNeeded(args) {
+    if (args.waitReasonCode !== "CDP_RUNTIME_UNAVAILABLE" &&
+        args.waitReasonCode !== "PLAYWRIGHT_CDP_UNAVAILABLE" &&
+        args.waitReasonCode !== "RUNTIME_PREFLIGHT_FAILED") {
+        return;
+    }
+    await openRuntimeIncident({
+        kind: args.waitReasonCode,
+        source: args.source,
+        detail: args.detail,
+        evidence_ref: args.evidenceRef,
+        cdp_url: args.cdpUrl,
+    });
+}
 async function stopTaskForRetry(args) {
     args.task.wait = {
         wait_reason_code: args.waitReasonCode,
@@ -325,11 +343,18 @@ export async function prepareTaskForAgent(args) {
         throw new Error(`Task ${args.taskId} does not exist.`);
     }
     markTaskStageTimestamp(task, "prepare_started_at");
-    const runtime = await runPreflight(await resolveBrowserRuntime(args.cdpUrl));
+    const runtime = await runPreflight(await resolveBrowserRuntime(args.cdpUrl), { mode: "light" });
     const preflightPath = getLatestPreflightPath();
     await writeJsonFile(preflightPath, runtime);
     if (!runtime.ok) {
         const failure = inferPreflightFailure({ runtime, stage: "task-prepare" });
+        await recordRuntimeIncidentIfNeeded({
+            waitReasonCode: failure.wait_reason_code,
+            detail: failure.detail,
+            evidenceRef: preflightPath,
+            source: "task-prepare",
+            cdpUrl: runtime.cdp_url,
+        });
         return stopTaskForRetry({
             task,
             replayHit: false,
@@ -437,12 +462,24 @@ export async function prepareTaskForAgent(args) {
                 task.terminal_class = "upstream_5xx";
             }
             const scoutFailureReason = !scout.ok ? inferScoutFailureReason(scout) : "DIRECTORY_UPSTREAM_5XX";
+            const scoutFailureDetail = scoutFailureReason === "SCOUT_SESSION_TIMEOUT"
+                ? "Retry later after resetting the shared CDP scout session; the page itself loaded, but the reused browser page failed to release cleanly."
+                : scoutFailureReason === "PLAYWRIGHT_CDP_UNAVAILABLE"
+                    ? `Retry later after restoring the shared Playwright/CDP session: ${scout.surface_summary}`
+                    : "Retry later after the directory becomes reachable again.";
+            if (scoutFailureReason === "PLAYWRIGHT_CDP_UNAVAILABLE") {
+                await recordRuntimeIncidentIfNeeded({
+                    waitReasonCode: scoutFailureReason,
+                    detail: scoutFailureDetail,
+                    evidenceRef: scoutArtifactPath,
+                    source: "task-prepare",
+                    cdpUrl: runtime.cdp_url,
+                });
+            }
             return stopTaskForRetry({
                 task,
                 replayHit: Boolean(replayPlaybook),
-                detail: scoutFailureReason === "SCOUT_SESSION_TIMEOUT"
-                    ? "Retry later after resetting the shared CDP scout session; the page itself loaded, but the reused browser page failed to release cleanly."
-                    : "Retry later after the directory becomes reachable again.",
+                detail: scoutFailureDetail,
                 waitReasonCode: scoutFailureReason,
                 evidenceRef: scoutArtifactPath,
                 scoutArtifactRef: scoutArtifactPath,

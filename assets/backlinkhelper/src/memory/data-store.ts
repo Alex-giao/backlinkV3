@@ -94,6 +94,14 @@ export function getLatestPreflightPath(): string {
   return path.join(DATA_DIRECTORIES.runs, "latest-preflight.json");
 }
 
+export function getRuntimeIncidentPath(): string {
+  return path.join(DATA_DIRECTORIES.runtime, "runtime-incident.json");
+}
+
+export function getRuntimeRecoveryStatusPath(): string {
+  return path.join(DATA_DIRECTORIES.runtime, "runtime-recovery-status.json");
+}
+
 export function getPlaybookFilePath(hostname: string): string {
   return path.join(DATA_DIRECTORIES.playbooks, `${hostnameToKey(hostname)}.json`);
 }

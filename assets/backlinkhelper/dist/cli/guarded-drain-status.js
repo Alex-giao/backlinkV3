@@ -95,11 +95,22 @@ async function loadLatestFollowUpSnapshots(tasks) {
     }
     return snapshots;
 }
+function buildRuntimeObservabilityReport(runtimeHealth) {
+    const recentRecoveryAttempts = runtimeHealth.recovery_status?.recent_attempts.slice(0, 5) ?? [];
+    return {
+        circuit_breaker_open: Boolean(runtimeHealth.runtime_incident),
+        incident: runtimeHealth.runtime_incident,
+        browser_target_health: runtimeHealth.browser_state,
+        last_recovery_attempt: runtimeHealth.recovery_status?.last_attempt,
+        recent_recovery_attempts: recentRecoveryAttempts,
+    };
+}
 export function buildGuardedDrainStatusPayload(args) {
     return {
         ok: args.blockers.length === 0,
         scope: args.scope,
         runtime_health: args.runtimeHealth,
+        runtime_observability: buildRuntimeObservabilityReport(args.runtimeHealth),
         repair: args.repair,
         report_default_view: "business_outcome",
         business_report: buildBusinessOutcomeReport(args.tasks),

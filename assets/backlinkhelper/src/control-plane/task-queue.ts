@@ -13,6 +13,8 @@ import {
   saveWorkerLease,
 } from "../memory/data-store.js";
 import { loadBrowserOwnership, reapExpiredBrowserOwnership } from "../execution/ownership-lock.js";
+import { loadRuntimeIncident } from "../shared/runtime-incident.js";
+import { tryAutoRecoverRuntimeIncident } from "../shared/runtime-sanitize.js";
 import { BOUNDED_WORKER_LEASE_TTL_MS } from "../shared/runtime-budgets.js";
 import { markTaskStageTimestamp } from "../shared/task-timing.js";
 import type {
@@ -44,6 +46,18 @@ const GENERIC_WAIT_REASON_CODES = new Set([
   RETRY_EXHAUSTED_WAIT_REASON_CODE,
   RETRY_CLASSIFICATION_PENDING_WAIT_REASON_CODE,
 ]);
+
+export let __testTryAutoRecoverRuntimeIncident = tryAutoRecoverRuntimeIncident;
+
+export function __setRuntimeRecoveryHookForTest(
+  hook: typeof tryAutoRecoverRuntimeIncident,
+): void {
+  __testTryAutoRecoverRuntimeIncident = hook;
+}
+
+export function __resetRuntimeRecoveryHookForTest(): void {
+  __testTryAutoRecoverRuntimeIncident = tryAutoRecoverRuntimeIncident;
+}
 
 type RetryDecisionBucket =
   | "terminal_success"
@@ -1710,6 +1724,7 @@ export async function claimNextTask(args: {
   task?: TaskRecord;
   lease?: WorkerLease;
   reapedTaskId?: string;
+  runtime_incident?: Awaited<ReturnType<typeof loadRuntimeIncident>>;
 }> {
   const { reapedTaskId } = await reapExpiredQueueState();
   const lane = args.lane ?? "active_any";
@@ -1738,6 +1753,18 @@ export async function claimNextTask(args: {
           lane,
         },
         reapedTaskId,
+      };
+    }
+  }
+
+  const runtimeIncident = await loadRuntimeIncident();
+  if (runtimeIncident) {
+    const recovery = await __testTryAutoRecoverRuntimeIncident(runtimeIncident.cdp_url);
+    if (!recovery.recovered) {
+      return {
+        mode: "idle",
+        reapedTaskId,
+        runtime_incident: runtimeIncident,
       };
     }
   }

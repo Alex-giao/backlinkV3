@@ -1690,12 +1690,17 @@ export async function runTakeoverFinalization(args) {
     }
     catch (error) {
         const evidenceRef = getArtifactFilePath(args.task.id, "finalization");
+        const rawMessage = error instanceof Error ? error.message : "Finalization session failed.";
+        const isPlaywrightAttachFailure = /connectovercdp|browsertype\.connectovercdp|playwright/i.test(rawMessage);
+        const detail = isPlaywrightAttachFailure
+            ? `Playwright could not reconnect to the shared browser for finalization: ${rawMessage}`
+            : `Finalization session failed: ${rawMessage}`;
         return {
             ok: false,
             next_status: "RETRYABLE",
-            detail: error instanceof Error ? `Finalization session failed: ${error.message}` : "Finalization session failed.",
+            detail,
             artifact_refs: [],
-            wait: inferWait("FINALIZATION_SESSION_FAILED", "system", "auto_resume", error instanceof Error ? error.message : "Finalization session failed.", evidenceRef),
+            wait: inferWait(isPlaywrightAttachFailure ? "PLAYWRIGHT_CDP_UNAVAILABLE" : "FINALIZATION_SESSION_FAILED", "system", "auto_resume", rawMessage, evidenceRef),
             terminal_class: "outcome_not_confirmed",
             agent_trace_ref: args.handoff.agent_trace_ref,
             agent_backend: args.handoff.agent_backend,

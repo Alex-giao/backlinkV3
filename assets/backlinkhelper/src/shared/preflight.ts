@@ -8,8 +8,18 @@ import type { BrowserRuntime, PreflightCheckResult } from "./types.js";
 interface CdpProbeResult {
   ok: boolean;
   browser_name?: string;
+  browser_id?: string;
   status?: number;
   error?: string;
+}
+
+function extractBrowserDebuggerId(webSocketDebuggerUrl?: string): string | undefined {
+  if (!webSocketDebuggerUrl) {
+    return undefined;
+  }
+
+  const match = webSocketDebuggerUrl.match(/\/devtools\/browser\/([^/?#]+)/);
+  return match?.[1];
 }
 
 async function probeCdpVersion(cdpUrl: string): Promise<CdpProbeResult> {
@@ -25,10 +35,11 @@ async function probeCdpVersion(cdpUrl: string): Promise<CdpProbeResult> {
       };
     }
 
-    const payload = (await response.json()) as { Browser?: string };
+    const payload = (await response.json()) as { Browser?: string; webSocketDebuggerUrl?: string };
     return {
       ok: true,
       browser_name: payload.Browser,
+      browser_id: extractBrowserDebuggerId(payload.webSocketDebuggerUrl),
     };
   } catch (error) {
     return {
@@ -63,8 +74,20 @@ async function getLoopbackConflictHint(cdpUrl: string): Promise<string> {
     return "";
   }
 
-  const alternateProbe = await probeCdpVersion(alternateUrl);
+  const [primaryProbe, alternateProbe] = await Promise.all([
+    probeCdpVersion(cdpUrl),
+    probeCdpVersion(alternateUrl),
+  ]);
   if (!alternateProbe.ok) {
+    return "";
+  }
+
+  if (
+    primaryProbe.ok &&
+    primaryProbe.browser_id &&
+    alternateProbe.browser_id &&
+    primaryProbe.browser_id === alternateProbe.browser_id
+  ) {
     return "";
   }
 
@@ -117,7 +140,19 @@ async function checkBrowserUseCli(): Promise<PreflightCheckResult> {
   };
 }
 
-async function checkPlaywright(cdpUrl: string): Promise<PreflightCheckResult> {
+export async function checkPlaywright(
+  cdpUrl: string,
+  options: {
+    mode?: "full" | "skip";
+  } = {},
+): Promise<PreflightCheckResult> {
+  if (options.mode === "skip") {
+    return {
+      ok: true,
+      detail: "Skipped full Playwright attach check in light preflight mode.",
+    };
+  }
+
   try {
     const browser = await chromium.connectOverCDP(cdpUrl);
     const context = browser.contexts()[0] ?? (await browser.newContext());
@@ -154,9 +189,16 @@ async function checkAgentBackend(): Promise<PreflightCheckResult> {
   };
 }
 
-export async function runPreflight(runtime: BrowserRuntime): Promise<BrowserRuntime> {
+export async function runPreflight(
+  runtime: BrowserRuntime,
+  options: {
+    mode?: "full" | "light";
+  } = {},
+): Promise<BrowserRuntime> {
   const cdp_runtime = await checkCdpRuntime(runtime.cdp_url);
-  const playwright = await checkPlaywright(runtime.cdp_url);
+  const playwright = await checkPlaywright(runtime.cdp_url, {
+    mode: options.mode === "light" ? "skip" : "full",
+  });
   const browser_use_cli = await checkBrowserUseCli();
   const agent_backend = await checkAgentBackend();
   const gog = await checkGog();

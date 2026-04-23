@@ -1,7 +1,8 @@
 import { loadBrowserOwnership } from "../execution/ownership-lock.js";
 import { listTasks, loadAllWorkerLeases, readJsonFile } from "../memory/data-store.js";
 import { buildTaskLaneReport, canRetry, matchesTaskScope, reapExpiredQueueState } from "../control-plane/task-queue.js";
-import { probeRuntimeHealth } from "../shared/runtime-health.js";
+import { probeRuntimeHealth, type BrowserTargetHealth, type RuntimeHealthSummary } from "../shared/runtime-health.js";
+import type { RuntimeRecoveryAttempt } from "../shared/runtime-sanitize.js";
 import { buildBusinessOutcomeReport } from "../shared/business-outcomes.js";
 import type { TaskRecord, WorkerLease } from "../shared/types.js";
 
@@ -52,10 +53,19 @@ export interface GuardedDrainSystemStatusReport {
   repeat_failure_host_top: Array<{ hostname: string; count: number }>;
 }
 
+export interface GuardedDrainRuntimeObservabilityReport {
+  circuit_breaker_open: boolean;
+  incident?: RuntimeHealthSummary["runtime_incident"];
+  browser_target_health?: BrowserTargetHealth;
+  last_recovery_attempt?: RuntimeRecoveryAttempt;
+  recent_recovery_attempts: RuntimeRecoveryAttempt[];
+}
+
 export interface GuardedDrainStatusPayload {
   ok: boolean;
   scope: GuardedDrainStatusScope;
-  runtime_health: unknown;
+  runtime_health: RuntimeHealthSummary;
+  runtime_observability: GuardedDrainRuntimeObservabilityReport;
   repair: unknown;
   report_default_view: "business_outcome";
   business_report: ReturnType<typeof buildBusinessOutcomeReport>;
@@ -181,9 +191,20 @@ async function loadLatestFollowUpSnapshots(tasks: TaskRecord[]): Promise<FollowU
   return snapshots;
 }
 
+function buildRuntimeObservabilityReport(runtimeHealth: RuntimeHealthSummary): GuardedDrainRuntimeObservabilityReport {
+  const recentRecoveryAttempts = runtimeHealth.recovery_status?.recent_attempts.slice(0, 5) ?? [];
+  return {
+    circuit_breaker_open: Boolean(runtimeHealth.runtime_incident),
+    incident: runtimeHealth.runtime_incident,
+    browser_target_health: runtimeHealth.browser_state,
+    last_recovery_attempt: runtimeHealth.recovery_status?.last_attempt,
+    recent_recovery_attempts: recentRecoveryAttempts,
+  };
+}
+
 export function buildGuardedDrainStatusPayload(args: {
   scope: GuardedDrainStatusScope;
-  runtimeHealth: unknown;
+  runtimeHealth: RuntimeHealthSummary;
   repair: unknown;
   tasks: TaskRecord[];
   activeLease?: WorkerLease;
@@ -196,6 +217,7 @@ export function buildGuardedDrainStatusPayload(args: {
     ok: args.blockers.length === 0,
     scope: args.scope,
     runtime_health: args.runtimeHealth,
+    runtime_observability: buildRuntimeObservabilityReport(args.runtimeHealth),
     repair: args.repair,
     report_default_view: "business_outcome",
     business_report: buildBusinessOutcomeReport(args.tasks),

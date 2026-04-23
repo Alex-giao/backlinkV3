@@ -18,6 +18,7 @@ import { enrichWaitMetadataWithMissingFields } from "../shared/missing-inputs.js
 import { resolveBrowserRuntime } from "../shared/browser-runtime.js";
 import { generateCredentialRef } from "../shared/email.js";
 import { runPreflight } from "../shared/preflight.js";
+import { openRuntimeIncident } from "../shared/runtime-incident.js";
 import { updateTaskExecutionStateFromFinalize, updateTaskExecutionStateFromOutcome } from "../shared/task-progress.js";
 import { markTaskStageTimestamp } from "../shared/task-timing.js";
 import type {
@@ -66,6 +67,29 @@ function inferPreflightFailure(runtime: BrowserRuntime): {
   };
 }
 
+async function recordRuntimeIncidentIfNeeded(args: {
+  waitReasonCode: string;
+  detail: string;
+  evidenceRef: string;
+  cdpUrl: string;
+}): Promise<void> {
+  if (
+    args.waitReasonCode !== "CDP_RUNTIME_UNAVAILABLE" &&
+    args.waitReasonCode !== "PLAYWRIGHT_CDP_UNAVAILABLE" &&
+    args.waitReasonCode !== "RUNTIME_PREFLIGHT_FAILED"
+  ) {
+    return;
+  }
+
+  await openRuntimeIncident({
+    kind: args.waitReasonCode,
+    source: "task-finalize",
+    detail: args.detail,
+    evidence_ref: args.evidenceRef,
+    cdp_url: args.cdpUrl,
+  });
+}
+
 export function applyFinalizeResultToTask(args: {
   task: TaskRecord;
   finalResult: FinalizeResult;
@@ -108,11 +132,17 @@ export async function finalizeTask(args: {
 
   markTaskStageTimestamp(task, "finalize_started_at");
 
-  const runtime = await runPreflight(await resolveBrowserRuntime(args.cdpUrl));
+  const runtime = await runPreflight(await resolveBrowserRuntime(args.cdpUrl), { mode: "light" });
   const preflightPath = getLatestPreflightPath();
   await writeJsonFile(preflightPath, runtime);
   if (!runtime.ok) {
     const failure = inferPreflightFailure(runtime);
+    await recordRuntimeIncidentIfNeeded({
+      waitReasonCode: failure.wait_reason_code,
+      detail: failure.detail,
+      evidenceRef: preflightPath,
+      cdpUrl: runtime.cdp_url,
+    });
     const retryResult: FinalizeResult = {
       ok: false,
       next_status: "RETRYABLE",
@@ -176,6 +206,15 @@ export async function finalizeTask(args: {
         // browser-use session teardown is imperfect.
       }
     }
+  }
+
+  if (finalResult.wait?.wait_reason_code) {
+    await recordRuntimeIncidentIfNeeded({
+      waitReasonCode: finalResult.wait.wait_reason_code,
+      detail: finalResult.detail,
+      evidenceRef: finalResult.wait.evidence_ref ?? preflightPath,
+      cdpUrl: runtime.cdp_url,
+    });
   }
 
   markTaskStageTimestamp(task, "finalize_finished_at");

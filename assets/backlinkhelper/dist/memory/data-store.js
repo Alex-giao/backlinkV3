@@ -62,6 +62,12 @@ export function getPendingFinalizePath(taskId) {
 export function getLatestPreflightPath() {
     return path.join(DATA_DIRECTORIES.runs, "latest-preflight.json");
 }
+export function getRuntimeIncidentPath() {
+    return path.join(DATA_DIRECTORIES.runtime, "runtime-incident.json");
+}
+export function getRuntimeRecoveryStatusPath() {
+    return path.join(DATA_DIRECTORIES.runtime, "runtime-recovery-status.json");
+}
 export function getPlaybookFilePath(hostname) {
     return path.join(DATA_DIRECTORIES.playbooks, `${hostnameToKey(hostname)}.json`);
 }
