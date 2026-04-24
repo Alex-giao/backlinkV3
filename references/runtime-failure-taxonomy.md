@@ -12,7 +12,7 @@
 
 下面这段内容原先位于 `SKILL.md` 的 `### Runtime facts`，现整体迁移到 reference，避免核心 skill 被 incident archive 挤厚。
 
-- 浏览器端口只用 `http://127.0.0.1:9224`
+- 浏览器端点以当前 brief / runtime 解析结果为准；不要把某个 loopback host（如 `127.0.0.1`）写成永真事实。若遇到 `127.0.0.1` 与 `localhost` 分裂，按 `runtime-known-gaps.md` 处理，并把 `PLAYWRIGHT_CDP_UNAVAILABLE` 视为 runtime restore 问题而不是站点证据
 - 每个任务必须使用 task-scoped browser-use session
 - 单任务默认 timebox：10 分钟
 - 默认：1 URL = 1 worker session

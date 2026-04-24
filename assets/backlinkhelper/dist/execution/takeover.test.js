@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { applyFamilySpecificOutcomeGuard, applySignupContinuationGuard, applyVisualVerificationGuard, buildBrowserUseSessionName, choosePreferredFinalizationPageStateSample, classifyEarlyTerminalOutcome, hasCredibleSignupContinuation, mustRunVisualGateBeforeClosure, runAgentDrivenBrowserUseLoop, shouldAttemptVisionRecovery, shouldRunVisualFallback, validateFinalizationPageContext, } from "./takeover.js";
+import { UNATTENDED_POLICY, applyFamilySpecificOutcomeGuard, applySignupContinuationGuard, applyVisualVerificationGuard, buildBrowserUseSessionName, choosePreferredFinalizationPageStateSample, classifyEarlyTerminalOutcome, hasCredibleSignupContinuation, mustRunVisualGateBeforeClosure, runAgentDrivenBrowserUseLoop, shouldAttemptVisionRecovery, shouldRunVisualFallback, validateFinalizationPageContext, } from "./takeover.js";
 function baseRetryableOutcome() {
     return {
         next_status: "RETRYABLE",
@@ -8,6 +8,9 @@ function baseRetryableOutcome() {
         terminal_class: "outcome_not_confirmed",
     };
 }
+test("unattended policy allows configured CAPTCHA solving", () => {
+    assert.equal(UNATTENDED_POLICY.allow_captcha_bypass, true);
+});
 test("repo-native agent loop is disabled in operator-only mode", async () => {
     await assert.rejects(() => runAgentDrivenBrowserUseLoop({
         runtime: {},

@@ -683,6 +683,50 @@ test("parking an exhausted retryable task does not trust stale success notes wit
   assert.equal(task.wait?.wait_reason_code, "AUTOMATIC_RETRY_EXHAUSTED");
 });
 
+test("buildRetryDecisionPlan reactivates exhausted tasks when execution blockers prove CDP runtime recovery", async () => {
+  const plan = await buildRetryDecisionPlan(
+    makeTask({
+      status: "WAITING_RETRY_DECISION",
+      wait: {
+        wait_reason_code: "AUTOMATIC_RETRY_EXHAUSTED",
+        resume_trigger: "Automatic retry budget exhausted.",
+        resolution_owner: "none",
+        resolution_mode: "terminal_audit",
+        evidence_ref: "latest-preflight.json",
+      },
+      execution_state: {
+        version: 1,
+        blockers: [
+          {
+            blocker_id: "blocker-1",
+            node_id: "node-1",
+            context_type: "retry_surface",
+            url: "https://example.com/submit",
+            blocker_type: "playwright_cdp_unavailable",
+            detail: ["browserType.connectOverCDP: Timeout 30000ms exceeded"],
+            severity: "soft",
+            unblock_requirement: "restore_runtime",
+            can_auto_resume: true,
+            consumes_retry_budget: false,
+            evidence_refs: ["latest-preflight.json"],
+            source: "prepare",
+            updated_at: "2026-04-23T00:00:00.000Z",
+            status: "active",
+          },
+        ],
+        discovered_actions: [],
+        evidence: [],
+        reusable_fragments: [],
+      },
+    }),
+    { healthy: true, summary: "runtime ok" },
+  );
+
+  assert.equal(plan.bucket, "runtime_reactivate_ready");
+  assert.equal(plan.nextStatus, "READY");
+  assert.match(plan.detail, /Runtime retry reactivated/);
+});
+
 test("buildRetryDecisionPlan cools down repeated stale-path retries instead of reactivating immediately", async () => {
   const plan = await buildRetryDecisionPlan(
     makeTask({

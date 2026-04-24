@@ -5,6 +5,7 @@ import {
   clearPendingFinalize,
   clearWorkerLease,
   ensureDataDirectories,
+  getWorkerLeasePath,
   listTasks,
   loadTask,
   loadWorkerLease,
@@ -820,6 +821,39 @@ function inferReasonFromText(text: string, flowFamily?: TaskRecord["flow_family"
   return undefined;
 }
 
+function hasRuntimeRecoveryBlocker(task: TaskRecord): boolean {
+  if (task.wait?.wait_reason_code !== RETRY_EXHAUSTED_WAIT_REASON_CODE) {
+    return false;
+  }
+
+  const executionState = task.execution_state as unknown as
+    | {
+        blockers?: Array<Record<string, unknown>>;
+        evidence?: Array<Record<string, unknown>>;
+      }
+    | undefined;
+  const blockers = executionState?.blockers ?? [];
+  const evidence = executionState?.evidence ?? [];
+  const runtimeSignals = [
+    ...blockers.flatMap((blocker) => [
+      blocker.blocker_type,
+      blocker.unblock_requirement,
+      ...(Array.isArray(blocker.detail) ? blocker.detail : [blocker.detail]),
+    ]),
+    ...evidence.flatMap((item) => [item.signal, item.content]),
+  ]
+    .filter((value): value is string => typeof value === "string")
+    .join("\n")
+    .toLowerCase();
+
+  return (
+    runtimeSignals.includes("playwright_cdp_unavailable") ||
+    runtimeSignals.includes("connectovercdp") ||
+    runtimeSignals.includes("cdp unavailable") ||
+    runtimeSignals.includes("restore_runtime")
+  );
+}
+
 function scoreRetryDecisionArtifactPath(candidatePath: string): number {
   const normalized = candidatePath.toLowerCase();
   if (normalized.includes("finalization.json")) {
@@ -938,8 +972,10 @@ export async function buildRetryDecisionPlan(
     hints.waitReasonCode && !GENERIC_WAIT_REASON_CODES.has(hints.waitReasonCode)
       ? hints.waitReasonCode
       : undefined;
+  const runtimeRecoveryReason = hasRuntimeRecoveryBlocker(task) ? "RUNTIME_PREFLIGHT_FAILED" : undefined;
   const inferredReason =
     prioritizedWaitReason ??
+    runtimeRecoveryReason ??
     hints.skipReasonCode ??
     inferReasonFromText(
       [
@@ -1453,7 +1489,7 @@ async function reapExpiredWorkerLease(
     resume_trigger: "A previous bounded worker exceeded the 10 minute runtime lease and will be retried automatically.",
     resolution_owner: "system",
     resolution_mode: "auto_resume",
-    evidence_ref: `data/backlink-helper/runtime/${group === "active" ? "task-worker-lease.json" : `task-worker-lease-${group}.json`}`,
+    evidence_ref: getWorkerLeasePath(group),
   };
   task.terminal_class = "outcome_not_confirmed";
   task.notes.push("bounded worker timed out");

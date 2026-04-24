@@ -4,6 +4,7 @@ import { getFamilyConfig } from "../families/index.js";
 import { clickBrowserUseElement, getBrowserUseSnapshot, inputBrowserUseElement, openBrowserUseUrl, saveBrowserUseScreenshot, selectBrowserUseElement, sendBrowserUseKeys, settleBrowserUsePage, waitForBrowserUseSelector, waitForBrowserUseText, } from "./browser-use-cli.js";
 import { runVisualRecoveryHint } from "./visual-verify.js";
 import { verifyLinkOnPage } from "./link-verifier.js";
+import { attemptCapsolverContinuation } from "./capsolver.js";
 import { DATA_DIRECTORIES, getArtifactFilePath, writeJsonFile, } from "../memory/data-store.js";
 import { extractMissingInputFields } from "../shared/missing-inputs.js";
 import { AGENT_LOOP_RUNTIME_BUDGET_MS } from "../shared/runtime-budgets.js";
@@ -12,7 +13,7 @@ import { withConnectedPage } from "../shared/playwright-session.js";
 export const UNATTENDED_POLICY = {
     allow_paid_listing: false,
     allow_reciprocal: false,
-    allow_captcha_bypass: false,
+    allow_captcha_bypass: true,
     allow_google_oauth_chooser: true,
     allow_password_login: false,
     allow_public_signup: true,
@@ -1508,7 +1509,7 @@ export async function runTakeoverFinalization(args) {
         return await withConnectedPage(args.runtime.cdp_url, async (page) => {
             const artifactPath = getArtifactFilePath(args.task.id, "finalization");
             const screenshotPath = path.join(DATA_DIRECTORIES.artifacts, `${args.task.id}-finalization.png`);
-            const pageState = await captureFinalizationPageState({
+            let pageState = await captureFinalizationPageState({
                 page,
                 recordedSteps: args.handoff.recorded_steps,
             }).catch(async () => ({
@@ -1519,10 +1520,11 @@ export async function runTakeoverFinalization(args) {
                 hasVisibleOverlaySurface: false,
                 surfaceFingerprint: "",
             }));
-            const currentUrl = pageState.currentUrl || args.handoff.current_url;
-            const title = pageState.title;
-            const bodyText = mergeFinalizationVisibleText(pageState.bodyText, pageState.visibleSurfaceText);
+            let currentUrl = pageState.currentUrl || args.handoff.current_url;
+            let title = pageState.title;
+            let bodyText = mergeFinalizationVisibleText(pageState.bodyText, pageState.visibleSurfaceText);
             let screenshotAvailable = false;
+            let captchaSolverAttempt;
             try {
                 await page.screenshot({ path: screenshotPath, fullPage: true });
                 screenshotAvailable = true;
@@ -1550,6 +1552,7 @@ export async function runTakeoverFinalization(args) {
                     recorded_steps: args.handoff.recorded_steps,
                     proposed_outcome: args.handoff.proposed_outcome,
                     final_outcome: guardedOutcome,
+                    captcha_solver_attempt: captchaSolverAttempt,
                     visual_verification: args.handoff.visual_verification,
                     vision_recovery_attempts: args.handoff.vision_recovery_attempts,
                     agent_trace_ref: args.handoff.agent_trace_ref,
@@ -1567,6 +1570,34 @@ export async function runTakeoverFinalization(args) {
                     agent_backend: args.handoff.agent_backend,
                     agent_steps_count: args.handoff.agent_steps_count,
                 };
+            }
+            captchaSolverAttempt = await attemptCapsolverContinuation({
+                page,
+                websiteURL: currentUrl,
+                submitAfterSolve: true,
+            });
+            if (captchaSolverAttempt.solved && captchaSolverAttempt.applied) {
+                pageState = await captureFinalizationPageState({
+                    page,
+                    recordedSteps: args.handoff.recorded_steps,
+                }).catch(async () => ({
+                    currentUrl: page.url() || currentUrl,
+                    title: await page.title().catch(() => title),
+                    bodyText: await page.locator("body").innerText().catch(() => bodyText),
+                    visibleSurfaceText: "",
+                    hasVisibleOverlaySurface: false,
+                    surfaceFingerprint: "",
+                }));
+                currentUrl = pageState.currentUrl || currentUrl;
+                title = pageState.title;
+                bodyText = mergeFinalizationVisibleText(pageState.bodyText, pageState.visibleSurfaceText);
+                try {
+                    await page.screenshot({ path: screenshotPath, fullPage: true });
+                    screenshotAvailable = true;
+                }
+                catch {
+                    screenshotAvailable = false;
+                }
             }
             const linkVerification = await verifyLinkOnPage({
                 page,
@@ -1646,6 +1677,7 @@ export async function runTakeoverFinalization(args) {
                 recorded_steps: args.handoff.recorded_steps,
                 proposed_outcome: args.handoff.proposed_outcome,
                 final_outcome: guardedOutcome,
+                captcha_solver_attempt: captchaSolverAttempt,
                 visual_verification: visualVerification,
                 link_verification: linkVerification,
                 vision_recovery_attempts: args.handoff.vision_recovery_attempts,

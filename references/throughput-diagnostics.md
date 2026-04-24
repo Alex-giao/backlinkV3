@@ -26,7 +26,7 @@ Use this when a bounded BacklinkHelper V3 cron/worker feels too slow for product
    - Report both touched and closed; otherwise throughput will be overstated.
 
 4. Task-file reality check
-   - Read `data/backlink-helper/tasks/<prefix>*.json` and aggregate:
+   - Read `$BACKLINKHELPER_STATE_DIR/tasks/<prefix>*.json` and aggregate:
      - `status`
      - `flow_family`
      - `wait.wait_reason_code`

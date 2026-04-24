@@ -192,8 +192,8 @@ Recommended Hermes pattern:
 - each task still follows `claim-next-task -> task-prepare -> operator reasoning -> task-record-agent-trace -> task-finalize`
 
 6. Monitor by truth, not by startup logs:
-- task state recounts under `data/backlink-helper/tasks/*.json`
-- worker lease file under `data/backlink-helper/runtime/task-worker-lease.json`
+- task state recounts under `$BACKLINKHELPER_STATE_DIR/tasks/*.json`
+- worker lease file under `$BACKLINKHELPER_STATE_DIR/runtime/task-worker-lease.json`
 - process status
 
 7. Report honestly:
@@ -296,6 +296,40 @@ Operator rule:
 - if you need the accepted flags, inspect `src/cli/index.ts` / `src/cli/follow-up-tick.ts`
 - in production runs, pass the explicit scope flags (`--task-id-prefix`, `--promoted-hostname`, or `--promoted-url`) and owner directly on the first invocation
 
+### Do not probe `claim-next-task` with `--help`
+
+Observed CLI pitfall:
+- `corepack pnpm claim-next-task -- --help` can execute a real claim instead of printing usage
+- at least one live run claimed a scoped task immediately and wrote a lease/notes entry rather than showing help text
+
+Operator rule:
+- do not use `--help` as a dry-run probe for this subcommand either
+- inspect `src/cli/index.ts` / `src/cli/claim-next-task.ts` for accepted flags
+- when running live, pass explicit `--owner`, `--lane`, and scope flags on the first invocation so an accidental default claim cannot widen the blast radius
+
+### Follow-up ticks inherit the same runtime-incident gate as normal claims
+
+Observed runtime behavior:
+- `follow-up-tick` calls the same `claimNextTask(... lane: "follow_up")` path as other queue claims
+- if a runtime incident / circuit breaker is still open, the claim step returns `mode: "idle"` before lane-specific follow-up selection happens
+- this can happen even when you are only targeting `WAITING_EXTERNAL_EVENT` / `WAITING_SITE_RESPONSE` continuations and even when the scoped follow-up inventory is already zero
+
+Operator rule:
+- when a scoped `follow-up-tick` returns `idle`, do not immediately interpret that as "no continuation work exists"
+- inspect the prior `guarded-drain-status` payload for `runtime_incident` / circuit-breaker state first
+- in reporting, distinguish `idle because no follow-up tasks matched` from `idle because the runtime breaker is still open`
+- if guarded status already shows zero scoped follow-up tasks, keep the report concise and do not overstate the breaker as a follow-up delta
+### `corepack pnpm <command>` output is not guaranteed to be pure JSON
+
+Observed CLI pitfall:
+- repo commands such as `guarded-drain-status` can print the package-manager preamble before the JSON payload
+- a scripted caller that assumes stdout starts with `{` can fail to parse otherwise-valid command output
+
+Operator rule:
+- for machine parsing, either call `node dist/cli/index.js ...` directly or strip the `pnpm` preamble before JSON parsing
+- do not treat a top-level JSON parse failure as proof that the repo command itself failed
+- when you only need human reporting, it is fine to run the normal `corepack pnpm ...` form and read the payload manually
+
 ### Manual browser-use in guarded drain may need the websocket CDP URL
 
 Observed failure mode:
@@ -339,12 +373,15 @@ Observed runtime failure mode:
 - `http://127.0.0.1:9224/json/version` and `/json/list` both respond normally
 - `guarded-drain-status` shows `cdp=true` and sometimes `browser_use=true`
 - but `Playwright connectOverCDP(...)` still times out after the websocket connects
+- one concrete variant: `task-prepare --cdp-url http://127.0.0.1:9224` reports that the alternate loopback host `http://localhost:9224` responds as a Chrome instance, suggesting the two loopback listeners are not actually the same browser/runtime
+- newer runtime wording may explicitly say another browser instance is likely occupying one loopback listener and recommend `Use http://localhost:9224 directly or restart on a clean port.` Treat that as the same split-listener failure class, not as a target-site blocker
 - `task-prepare` may then auto-stop the task into a system-owned retryable state such as `RETRYABLE` + `PLAYWRIGHT_CDP_UNAVAILABLE`
 
 Operator rule:
 - treat this as runtime health failure, not a site-specific blocker
 - if `task-prepare` already wrote the task into retryable auto-resume state, do **not** force a manual agent loop just to satisfy the normal chain
 - verify the persisted task JSON (`status`, `wait`, `terminal_class`, notes/evidence) and report the runtime blocker as the actual outcome of that tick
+- when the error explicitly mentions the alternate loopback host, suspect a `127.0.0.1` vs `localhost` listener split/conflict before blaming the target site; retry with the canonical host the runtime expects or restart on a clean port
 - prefer `guarded-drain-status` plus a direct Playwright `connectOverCDP` probe when you need to distinguish “Chrome HTTP endpoint alive” from “authoritative Playwright layer usable”
 
 ### Login overlays can create false signup retries

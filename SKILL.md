@@ -14,6 +14,12 @@ description: operate backlinkhelper v3 for bounded single-site backlink tasks un
 
 不要把它写成站点步骤手册、运维流水账、bug 年鉴或临时经验集。
 
+## Runtime Pitfalls To Remember
+
+- CapSolver 只能证明“验证码已解并已回填/尝试提交”，不能证明“点到了正确的提交按钮”。对有站内搜索、newsletter、multi-form 混排的页面，submit selector 必须优先收敛到当前目标表单（例如 `form#commentform`、`#commentform input#submit`、`form[action*="comment"]`），不要用过宽的全页 `input[type="submit"]` / `button[type="submit"]` 兜底顺序放前面。
+- 如果验证码 solve 成功后页面却跳到明显无关页面（如站内搜索 `?s=`、首页订阅确认、其他非目标表单落点），先怀疑“submit 命中错表单”，不要误判成 CapSolver 失败或站点拒绝。
+- 对 comment family，验收要拆成两层：`captcha/submit path passed` 与 `comment/backlink live`。出现 `#comment-...` 只能说明提交流程大概率接受，仍要 fresh reload 做 live/backlink 验证，避免把 moderation pending 误报为成功。
+
 ## Strategy Philosophy
 
 ### 1. 先定义本轮成功标准
@@ -142,7 +148,28 @@ finalization 负责 authoritative 收口，不负责替 agent 发明成功故事
 - 只有拿到 live backlink verification，才算真正完成
 - 不能把 stale tab、错 host、旧 JSON 里的 verifier 结果当成当前任务的成功证据
 
+### 7. CapSolver unattended continuation
+
+无人值守模式下，受支持的 CAPTCHA 不再是默认人工边界。
+
+用途：
+- reCAPTCHA v2 token solve
+- Cloudflare Turnstile token solve
+- image/security-code OCR solve
+
+能力细节与配置在 `references/capsolver-unattended.md`；最终仍以 live-link / confirmation / wait evidence 收口，不能把“solver 返回 token/text”本身当成提交成功。
+
 ## Necessary Facts
+
+### 0. Runtime state lives outside the skill code tree
+
+默认结构化运行状态根目录是 `$HERMES_HOME/state/backlinkhelper-v3`（通常为 `/home/gc/.hermes/state/backlinkhelper-v3`）。
+
+兼容环境变量：
+- `BACKLINER_DATA_ROOT`：旧变量，最高优先级
+- `BACKLINKHELPER_STATE_DIR`：新变量，指向外置 state root
+
+不要再把 task / artifacts / accounts / runtime locks 当成 skill 代码目录内的事实；旧 `assets/backlinkhelper/data/backlink-helper` 路径只应作为兼容 symlink 或历史引用。
 
 ### 1. Operator-only 主链是 repo-native 真相源
 
@@ -169,6 +196,11 @@ finalization 负责 authoritative 收口，不负责替 agent 发明成功故事
 duplicate preflight 是 **exact-host** 口径：
 - `saashub.com` 与 `community.saashub.com` 不合并
 - 同一 promoted host + 同一 exact target host，不应再开平行新任务
+- duplicate 只在 **payload 完全等价** 时直接 reuse；这里的 payload 至少包括 target URL、effective flow family、submission/promoted-profile payload
+- 若 payload 不同且任一 exact-host sibling 正在 `RUNNING`，应直接 block，而不是改写别的 sibling
+- 若 payload 不同且没有 `RUNNING` sibling，可 authoritative 覆盖一个 non-running duplicate 并 reset 回 `READY`
+- authoritative duplicate replacement 若省略 `flow_family`，应按 fresh enqueue 默认语义处理，而不是静默沿用旧 family
+- 若存在 payload 等价的 duplicate，即使另一个 exact-host sibling 正在 `RUNNING` 且 payload 冲突，也应优先复用/重激活这个等价 duplicate
 
 ### 4. READY / RETRYABLE active 任务不再只看 FIFO
 
@@ -203,11 +235,55 @@ duplicate preflight 是 **exact-host** 口径：
 
 不要在核心 skill 里把 `9223`、`9224`、`9333` 之类的某个端口写成永真事实。
 
-### 8. mailbox capability 的判断要看 runtime 能力，不看某一个命令名
+补充：同一个 shared CDP 端口也可能出现 loopback host 差异（例如 `127.0.0.1` 与 `localhost` 表现不同）。若出现 `cdp_runtime=true` 但 `playwright=false`，且错误提示 alternate loopback host 能连上 Chrome，不要硬跑 operator loop；应把它视为 runtime 侧 blocker，按 retryable / waiting 语义收口，等待 canonical endpoint 或 listener 冲突修复。
+
+### 8. open runtime incident / circuit breaker 会让 claim 返回 idle，不等于队列空
+
+`guarded-drain-status` 可能显示底层 checks 都是 true（`cdp=true`, `playwright=true`, `browser_use=true`, `gog=true`），但同时 summary / blockers 里仍写着 circuit breaker open，例如来自较早一次 `task-prepare` 的 `PLAYWRIGHT_CDP_UNAVAILABLE` incident。
+
+当前实现里，`claim-next-task` 会先看 active lease / browser ownership，再看 `runtime_incident`；只要 open incident 还没被 auto-recover 清掉，就会直接返回 `mode: "idle"`，即使 scope 内仍有 eligible `RETRYABLE` 任务。
+
+因此：
+- 不要把 `claim-next-task -> idle` 直接解释成“本 scope 没任务”
+- 先看返回里的 `runtime_incident` 字段
+- bounded tick 汇报里应把它报告成 runtime blocker，而不是 queue empty
+- 若本轮用户要求“claim exactly one task”，在这种情况下应停在单行状态，不要强行挑第二条路径绕过状态机
+
+### 9. queue scope 里的 `promotedUrl` 是精确字符串匹配，不是规范化 URL 语义
+
+当前 `matchesTaskScope()` 直接比较 `task.submission.promoted_profile.url === scope.promotedUrl`。
+
+这意味着像 `https://geometrydashjp.com` 与 `https://geometrydashjp.com/` 这种尾斜杠差异，会把本来属于同一 promoted site 的任务错误排除在 scope 外。
+
+做 bounded status / follow-up / claim scoped run 时：
+- 若未先确认 repo 里保存的 canonical promoted URL 形式，优先用 `task-id-prefix + promoted-hostname`
+- 不要把 `--promoted-url` 当成天然安全的 scope 收窄器
+- 若必须带 `--promoted-url`，先确认 task state 里的精确字符串
+
+### 9. `guarded-drain-status` 不是纯只读状态查看
+
+当前实现里它会先执行 `reapExpiredQueueState()`，因此可能顺手修复 / 停放已耗尽的任务，
+例如把不再应自动重试的 `RETRYABLE` 任务改写到 `WAITING_RETRY_DECISION`。
+
+因此：
+- 不要把它当成绝对无副作用的 status probe
+- 做 bounded tick 的前后对比时，要把这类 repair mutation 与真正的 follow-up continuation 区分开
+- 如果你要报告“follow-up 有无变化”，优先只统计 `WAITING_EXTERNAL_EVENT` / `WAITING_SITE_RESPONSE` continuation 的增量
+
+### 10. mailbox capability 的判断要看 runtime 能力，不看某一个命令名
 
 不要把“shell 里直接跑 `gog` 成功 / 失败”当成邮箱能力的唯一真相源。
 
 当 repo 命令可用、Gmail / Google Workspace capability 可用时，应继续走 mailbox 主路径。
+
+### 9. 不要把 mutating repo CLI 子命令当成有安全 `--help` 的传统 CLI
+
+有些 repo-native 子命令不会因为传了 `--help` 就进入帮助模式；解析器可能直接忽略它并正常执行命令。
+
+因此：
+- 不要用 `claim-next-task --help`、`task-prepare --help`、`task-finalize --help` 这类方式探参数
+- 先读 `package.json`、`dist/cli/index.js` 或对应命令实现，再执行真正的命令
+- 若误触发 claim / lease，先做 authoritative state restore，再继续本轮 bounded tick
 
 ## Safety Boundaries
 
@@ -239,6 +315,7 @@ duplicate preflight 是 **exact-host** 口径：
 - `references/throughput-diagnostics.md`
 - `references/non-parallel-optimization-plan.md`
 - `references/runtime-known-gaps.md`
+- `references/capsolver-unattended.md`
 
 ### Run modes
 - `references/run-modes/queue-and-guarded-drain.md`

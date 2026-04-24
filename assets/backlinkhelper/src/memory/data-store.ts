@@ -1,4 +1,5 @@
 import { mkdir, readdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -14,9 +15,29 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 export const REPO_ROOT = path.resolve(__dirname, "../..");
-export const DATA_ROOT = process.env.BACKLINER_DATA_ROOT?.trim()
-  ? path.resolve(process.env.BACKLINER_DATA_ROOT.trim())
-  : path.join(REPO_ROOT, "data", "backlink-helper");
+
+function configuredDataRoot(): string | undefined {
+  const legacyDataRoot = process.env.BACKLINER_DATA_ROOT?.trim();
+  if (legacyDataRoot) {
+    return legacyDataRoot;
+  }
+
+  const stateDir = process.env.BACKLINKHELPER_STATE_DIR?.trim();
+  if (stateDir) {
+    return stateDir;
+  }
+
+  return undefined;
+}
+
+function defaultDataRoot(): string {
+  const hermesHome = process.env.HERMES_HOME?.trim()
+    ? path.resolve(process.env.HERMES_HOME.trim())
+    : path.join(homedir(), ".hermes");
+  return path.join(hermesHome, "state", "backlinkhelper-v3");
+}
+
+export const DATA_ROOT = path.resolve(configuredDataRoot() ?? defaultDataRoot());
 
 export const DATA_DIRECTORIES = {
   accounts: path.join(DATA_ROOT, "accounts"),

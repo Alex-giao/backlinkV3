@@ -28,10 +28,10 @@ V3 现在有两层机制：
 ## Layer 0：自动留痕（每次 run 默认发生）
 
 V3 的自动沉淀底座包括：
-- `data/backlink-helper/tasks/*.json`
-- `data/backlink-helper/artifacts/*`
-- `data/backlink-helper/runtime/*`
-- `data/backlink-helper/playbooks/sites/*.json`
+- `$BACKLINKHELPER_STATE_DIR/tasks/*.json`
+- `$BACKLINKHELPER_STATE_DIR/artifacts/*`
+- `$BACKLINKHELPER_STATE_DIR/runtime/*`
+- `$BACKLINKHELPER_STATE_DIR/playbooks/sites/*.json`
 - task 内的 `execution_state`
 
 其中：
@@ -70,7 +70,7 @@ V3 不是没有沉淀底座，而是已经有自动留痕底座。
 
 ### A. 只适用于单 hostname / 单站点路径
 放这里：
-- `data/backlink-helper/playbooks/sites/*.json`
+- `$BACKLINKHELPER_STATE_DIR/playbooks/sites/*.json`
 - `execution_state`
 - runtime docs / casebook
 

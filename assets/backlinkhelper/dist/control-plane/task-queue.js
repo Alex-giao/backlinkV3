@@ -1,7 +1,7 @@
 import { loadOrCreatePromotedProfile } from "../shared/promoted-profile.js";
 import { getFamilyConfig, resolveFlowFamily } from "../families/index.js";
 import { buildTargetPreflightAssessment, findExactHostDuplicateTasks } from "./target-preflight.js";
-import { clearPendingFinalize, clearWorkerLease, ensureDataDirectories, listTasks, loadTask, loadWorkerLease, readJsonFile, saveTask, saveWorkerLease, } from "../memory/data-store.js";
+import { clearPendingFinalize, clearWorkerLease, ensureDataDirectories, getWorkerLeasePath, listTasks, loadTask, loadWorkerLease, readJsonFile, saveTask, saveWorkerLease, } from "../memory/data-store.js";
 import { loadBrowserOwnership, reapExpiredBrowserOwnership } from "../execution/ownership-lock.js";
 import { loadRuntimeIncident } from "../shared/runtime-incident.js";
 import { tryAutoRecoverRuntimeIncident } from "../shared/runtime-sanitize.js";
@@ -579,6 +579,29 @@ function inferReasonFromText(text, flowFamily) {
     }
     return undefined;
 }
+function hasRuntimeRecoveryBlocker(task) {
+    if (task.wait?.wait_reason_code !== RETRY_EXHAUSTED_WAIT_REASON_CODE) {
+        return false;
+    }
+    const executionState = task.execution_state;
+    const blockers = executionState?.blockers ?? [];
+    const evidence = executionState?.evidence ?? [];
+    const runtimeSignals = [
+        ...blockers.flatMap((blocker) => [
+            blocker.blocker_type,
+            blocker.unblock_requirement,
+            ...(Array.isArray(blocker.detail) ? blocker.detail : [blocker.detail]),
+        ]),
+        ...evidence.flatMap((item) => [item.signal, item.content]),
+    ]
+        .filter((value) => typeof value === "string")
+        .join("\n")
+        .toLowerCase();
+    return (runtimeSignals.includes("playwright_cdp_unavailable") ||
+        runtimeSignals.includes("connectovercdp") ||
+        runtimeSignals.includes("cdp unavailable") ||
+        runtimeSignals.includes("restore_runtime"));
+}
 function scoreRetryDecisionArtifactPath(candidatePath) {
     const normalized = candidatePath.toLowerCase();
     if (normalized.includes("finalization.json")) {
@@ -672,7 +695,9 @@ export async function buildRetryDecisionPlan(task, runtimeHealth) {
     const prioritizedWaitReason = hints.waitReasonCode && !GENERIC_WAIT_REASON_CODES.has(hints.waitReasonCode)
         ? hints.waitReasonCode
         : undefined;
+    const runtimeRecoveryReason = hasRuntimeRecoveryBlocker(task) ? "RUNTIME_PREFLIGHT_FAILED" : undefined;
     const inferredReason = prioritizedWaitReason ??
+        runtimeRecoveryReason ??
         hints.skipReasonCode ??
         inferReasonFromText([
             task.last_takeover_outcome,
@@ -1115,7 +1140,7 @@ async function reapExpiredWorkerLease(group) {
         resume_trigger: "A previous bounded worker exceeded the 10 minute runtime lease and will be retried automatically.",
         resolution_owner: "system",
         resolution_mode: "auto_resume",
-        evidence_ref: `data/backlink-helper/runtime/${group === "active" ? "task-worker-lease.json" : `task-worker-lease-${group}.json`}`,
+        evidence_ref: getWorkerLeasePath(group),
     };
     task.terminal_class = "outcome_not_confirmed";
     task.notes.push("bounded worker timed out");

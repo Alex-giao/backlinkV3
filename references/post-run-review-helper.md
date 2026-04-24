@@ -29,7 +29,7 @@
 ## 先读哪些输入
 
 每次 review 至少看：
-1. `data/backlink-helper/tasks/<taskId>.json`
+1. `$BACKLINKHELPER_STATE_DIR/tasks/<taskId>.json`
 2. 最新 finalization artifact
 3. agent trace / operator evidence
 4. 对应 hostname 的 playbook（如存在）

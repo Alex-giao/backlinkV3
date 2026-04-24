@@ -1,12 +1,15 @@
-# Runtime state and private local data
-assets/backlinkhelper/data/backlink-helper/
+# Runtime state and private local data (canonical runtime state lives outside the repo)
+assets/backlinkhelper/data/
+assets/backlinkhelper/artifacts/
+assets/backlinkhelper/logs/
+assets/backlinkhelper/browser-profiles/
 
 # Dependencies
 assets/backlinkhelper/node_modules/
 
 # Local temp helpers / scratch runs
 assets/backlinkhelper/tmp/
-assets/backlinkhelper/tmp-*.mjs
+assets/backlinkhelper/tmp-*
 
 # Common local noise
 .DS_Store
