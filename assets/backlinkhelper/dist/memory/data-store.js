@@ -2,6 +2,7 @@ import { mkdir, readdir, readFile, rm, unlink, writeFile } from "node:fs/promise
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createWranglerD1DataStore } from "./wrangler-d1-data-store.js";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 export const REPO_ROOT = path.resolve(__dirname, "../..");
@@ -34,7 +35,7 @@ export const DATA_DIRECTORIES = {
     tasks: path.join(DATA_ROOT, "tasks"),
     vault: path.join(DATA_ROOT, "vault"),
 };
-export async function ensureDataDirectories() {
+async function ensureFileDataDirectories() {
     await Promise.all(Object.values(DATA_DIRECTORIES).map((directoryPath) => mkdir(directoryPath, { recursive: true })));
 }
 export async function readJsonFile(filePath) {
@@ -96,56 +97,156 @@ export function getAccountFilePath(hostname) {
 export function getCredentialFilePath(credentialRef) {
     return path.join(DATA_DIRECTORIES.vault, `${hostnameToKey(credentialRef)}.json`);
 }
+export class FileDataStore {
+    kind = "file";
+    async ensureDataDirectories() {
+        await ensureFileDataDirectories();
+    }
+    async loadTask(taskId) {
+        return readJsonFile(getTaskFilePath(taskId));
+    }
+    async saveTask(task) {
+        await writeJsonFile(getTaskFilePath(task.id), task);
+    }
+    async listTasks() {
+        await mkdir(DATA_DIRECTORIES.tasks, { recursive: true });
+        const entries = await readdir(DATA_DIRECTORIES.tasks, { withFileTypes: true });
+        const tasks = await Promise.all(entries
+            .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+            .map((entry) => readJsonFile(path.join(DATA_DIRECTORIES.tasks, entry.name))));
+        return tasks.filter((task) => Boolean(task));
+    }
+    async loadWorkerLease(group = "active") {
+        return readJsonFile(getWorkerLeasePath(group));
+    }
+    async loadAllWorkerLeases() {
+        const leases = await Promise.all(WORKER_LEASE_GROUPS.map(async (group) => [group, await this.loadWorkerLease(group)]));
+        return Object.fromEntries(leases);
+    }
+    async saveWorkerLease(lease, group = lease.group ?? "active") {
+        await writeJsonFile(getWorkerLeasePath(group), {
+            ...lease,
+            group,
+        });
+    }
+    async clearWorkerLease(group = "active") {
+        const leasePath = getWorkerLeasePath(group);
+        try {
+            await unlink(leasePath);
+        }
+        catch (error) {
+            const typedError = error;
+            if (typedError.code !== "ENOENT") {
+                throw error;
+            }
+        }
+    }
+    async clearWorkerLeaseForTask(taskId) {
+        let cleared = false;
+        for (const group of WORKER_LEASE_GROUPS) {
+            const existingLease = await this.loadWorkerLease(group);
+            if (!existingLease || existingLease.task_id !== taskId) {
+                continue;
+            }
+            await this.clearWorkerLease(group);
+            cleared = true;
+        }
+        return cleared;
+    }
+    async loadAccountRecord(hostname) {
+        return readJsonFile(getAccountFilePath(hostname));
+    }
+    async saveAccountRecord(account) {
+        await writeJsonFile(getAccountFilePath(account.hostname), account);
+    }
+    async loadCredentialRecord(credentialRef) {
+        return readJsonFile(getCredentialFilePath(credentialRef));
+    }
+    async saveCredentialRecord(record) {
+        await writeJsonFile(getCredentialFilePath(record.credential_ref), record);
+    }
+    async deleteCredentialRecord(credentialRef) {
+        try {
+            await rm(getCredentialFilePath(credentialRef), { force: true });
+        }
+        catch (error) {
+            const typedError = error;
+            if (typedError.code !== "ENOENT") {
+                throw error;
+            }
+        }
+    }
+    async upsertTargetSite(target) {
+        await writeJsonFile(path.join(DATA_DIRECTORIES.runtime, "target-sites", `${hostnameToKey(target.hostname)}.json`), target);
+    }
+    async listTargetSites(limit = 100) {
+        const targetSiteDirectory = path.join(DATA_DIRECTORIES.runtime, "target-sites");
+        await mkdir(targetSiteDirectory, { recursive: true });
+        const entries = await readdir(targetSiteDirectory, { withFileTypes: true });
+        const sites = await Promise.all(entries
+            .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+            .sort((left, right) => left.name.localeCompare(right.name))
+            .slice(0, limit)
+            .map((entry) => readJsonFile(path.join(targetSiteDirectory, entry.name))));
+        return sites.filter((site) => Boolean(site));
+    }
+}
+export function getConfiguredStoreKind() {
+    const rawValue = process.env.BACKLINKHELPER_STORE?.trim().toLowerCase();
+    if (!rawValue || rawValue === "file") {
+        return "file";
+    }
+    if (rawValue === "d1" || rawValue === "cloudflare-d1") {
+        return "d1";
+    }
+    throw new Error(`Unsupported BACKLINKHELPER_STORE value: ${process.env.BACKLINKHELPER_STORE}`);
+}
+export function createConfiguredDataStore() {
+    const kind = getConfiguredStoreKind();
+    if (kind === "file") {
+        return new FileDataStore();
+    }
+    const databaseName = process.env.BACKLINKHELPER_D1_DATABASE_NAME?.trim();
+    if (!databaseName) {
+        throw new Error("BACKLINKHELPER_STORE=d1 requires BACKLINKHELPER_D1_DATABASE_NAME.");
+    }
+    const remote = process.env.BACKLINKHELPER_D1_LOCAL === "1" ? false : true;
+    return createWranglerD1DataStore({ databaseName, remote, cwd: REPO_ROOT });
+}
+let activeDataStore;
+export function getActiveDataStore() {
+    activeDataStore ??= createConfiguredDataStore();
+    return activeDataStore;
+}
+export function __setActiveDataStoreForTest(store) {
+    activeDataStore = store;
+}
+export async function ensureDataDirectories() {
+    await getActiveDataStore().ensureDataDirectories();
+}
 export async function loadTask(taskId) {
-    return readJsonFile(getTaskFilePath(taskId));
+    return getActiveDataStore().loadTask(taskId);
 }
 export async function saveTask(task) {
-    await writeJsonFile(getTaskFilePath(task.id), task);
+    await getActiveDataStore().saveTask(task);
 }
 export async function listTasks() {
-    await mkdir(DATA_DIRECTORIES.tasks, { recursive: true });
-    const entries = await readdir(DATA_DIRECTORIES.tasks, { withFileTypes: true });
-    const tasks = await Promise.all(entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-        .map((entry) => readJsonFile(path.join(DATA_DIRECTORIES.tasks, entry.name))));
-    return tasks.filter((task) => Boolean(task));
+    return getActiveDataStore().listTasks();
 }
 export async function loadWorkerLease(group = "active") {
-    return readJsonFile(getWorkerLeasePath(group));
+    return getActiveDataStore().loadWorkerLease(group);
 }
 export async function loadAllWorkerLeases() {
-    const leases = await Promise.all(WORKER_LEASE_GROUPS.map(async (group) => [group, await loadWorkerLease(group)]));
-    return Object.fromEntries(leases);
+    return getActiveDataStore().loadAllWorkerLeases();
 }
 export async function saveWorkerLease(lease, group = lease.group ?? "active") {
-    await writeJsonFile(getWorkerLeasePath(group), {
-        ...lease,
-        group,
-    });
+    await getActiveDataStore().saveWorkerLease(lease, group);
 }
 export async function clearWorkerLease(group = "active") {
-    const leasePath = getWorkerLeasePath(group);
-    try {
-        await unlink(leasePath);
-    }
-    catch (error) {
-        const typedError = error;
-        if (typedError.code !== "ENOENT") {
-            throw error;
-        }
-    }
+    await getActiveDataStore().clearWorkerLease(group);
 }
 export async function clearWorkerLeaseForTask(taskId) {
-    let cleared = false;
-    for (const group of WORKER_LEASE_GROUPS) {
-        const existingLease = await loadWorkerLease(group);
-        if (!existingLease || existingLease.task_id !== taskId) {
-            continue;
-        }
-        await clearWorkerLease(group);
-        cleared = true;
-    }
-    return cleared;
+    return getActiveDataStore().clearWorkerLeaseForTask(taskId);
 }
 export async function clearPendingFinalize(taskId) {
     try {
@@ -159,25 +260,23 @@ export async function clearPendingFinalize(taskId) {
     }
 }
 export async function loadAccountRecord(hostname) {
-    return readJsonFile(getAccountFilePath(hostname));
+    return getActiveDataStore().loadAccountRecord(hostname);
 }
 export async function saveAccountRecord(account) {
-    await writeJsonFile(getAccountFilePath(account.hostname), account);
+    await getActiveDataStore().saveAccountRecord(account);
 }
 export async function loadCredentialRecord(credentialRef) {
-    return readJsonFile(getCredentialFilePath(credentialRef));
+    return getActiveDataStore().loadCredentialRecord(credentialRef);
 }
 export async function saveCredentialRecord(record) {
-    await writeJsonFile(getCredentialFilePath(record.credential_ref), record);
+    await getActiveDataStore().saveCredentialRecord(record);
 }
 export async function deleteCredentialRecord(credentialRef) {
-    try {
-        await rm(getCredentialFilePath(credentialRef), { force: true });
-    }
-    catch (error) {
-        const typedError = error;
-        if (typedError.code !== "ENOENT") {
-            throw error;
-        }
-    }
+    await getActiveDataStore().deleteCredentialRecord(credentialRef);
+}
+export async function upsertTargetSite(target) {
+    await getActiveDataStore().upsertTargetSite(target);
+}
+export async function listTargetSites(limit) {
+    return getActiveDataStore().listTargetSites(limit);
 }

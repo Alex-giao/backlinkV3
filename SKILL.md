@@ -1,6 +1,6 @@
 ---
 name: web-backlinker-v3-operator
-description: operate backlinkhelper v3 for bounded single-site backlink tasks under an evidence-first philosophy. use when chatgpt needs to run the repo-native operator loop, inspect queue or follow-up state, apply runtime safeguards, or consult the bundled references for family-specific context, verification semantics, and non-parallel throughput optimization.
+description: operate backlinkhelper v3 for bounded single-site backlink tasks and default unattended, persistent promoted-site backlink campaigns under an evidence-first philosophy. use when chatgpt needs to run the repo-native operator loop, ensure/operate a scoped recurring watchdog, inspect scoped queue plus global target_sites intake, handle mailbox/follow-up continuation, apply runtime safeguards, or consult bundled references for family-specific context, verification semantics, and non-parallel throughput optimization.
 ---
 
 # Web Backlinker V3 Operator
@@ -14,11 +14,59 @@ description: operate backlinkhelper v3 for bounded single-site backlink tasks un
 
 不要把它写成站点步骤手册、运维流水账、bug 年鉴或临时经验集。
 
+## When to Use / Default Interpretation
+
+当用户说“给 `<promoted site>` 提交外链 / 做外链 / 跑 backlink / 宣传网站”且没有明确限定为单个 target URL 或一次性 dry-run 时，默认解释为该 promoted site 的**持续无人值守 campaign**：不仅要跑 repo-native operator 闭环，还要确认存在可持续拉起的 scoped recurring watchdog。
+
+默认执行语义：
+- 先把用户给的 promoted URL / hostname 锁成精确 scope。
+- 主入口优先用 repo-native `unattended-campaign`；不再把单次 `unattended-scope-tick` 当完整 campaign。
+- 主动检查 D1 scoped queue、active lease、runtime breaker、follow-up/mailbox 以及全局 `target_sites` candidate pool。
+- 单槽串行地“处理一个拿一个”：每次只 claim/enqueue 一个 active task，完成 `task-prepare -> operator/browser-use -> task-record-agent-trace -> task-finalize` 后，再跑 follow-up/mailbox，再回到 intake/claim。
+- 默认建立或恢复外层 recurring watchdog/cron：精确 scope、D1 store、固定 CDP endpoint、单槽串行、bounded tick、增量汇报；除非用户明确要求“只跑一次 / 不要定时 / 手动核验”。
+- watchdog 的每次运行只做小步 bounded tick，禁止重入并发，禁止在 cron-run 内递归创建/更新/删除 cron job。
+- 单个 target/task 遇到人工、政策、付费墙、手机号/passkey、账号锁定、solver 不支持等 blocker 时，只终止/跳过该任务并写回证据，不停止 campaign；watchdog 继续从 scoped queue 或全局 `target_sites` 拉下一个安全候选。
+- 直到达到 campaign 级真实停止条件：用户给定数量/时间/预算边界、scope 与全局 candidate pool 都无安全候选、全局 runtime/store/scope 安全 breaker 阻断所有任务，或用户明确停止。
+
+不要因为 scoped queue 暂时空、`unattended-scope-tick` 返回一次 `enqueued/claimed/no_candidate/cooldown`，就把 campaign 当成完成；也不要在没有外层调度器/runner 串起浏览器执行闭环时，把单个 intake CLI tick 伪装成完整无人值守提交能力。
+
+对 promoted-site backlink 请求，持续自跑是默认，不要求用户显式说“持续 / 无人值守”。必须核验外层 scheduler 是否真的存在并启用（例如 `cronjob list` 可见对应 recurring job）。只完成一轮 operator 或手动脚本后，不能汇报成持续无人值守；若没有 recurring runner/watchdog，应创建/恢复一个精确 scope、单槽串行、增量汇报的调度任务，或明确说明当前只是一次性 bounded run。
+
+## Source Repo / Installed Copy Notes
+
+- The GitHub source for the current BacklinkHelper V3 skill is `https://github.com/Alex-giao/backlinkV3.git`, not the older `glassesmonkey/backlinkhelper.git` line used by earlier v2/backlinkhelper migrations.
+- Primary local source/runtime tree is `/home/gc/backlinkV3`; the installed Hermes skill copy is `/home/gc/.hermes/skills/openclaw-imports/web-backlinker-v3-operator`. When the user asks to submit the current V3 skill/runtime to GitHub, verify git status/remotes from the repo tree and push to `Alex-giao/backlinkV3`.
+- Historical snapshots such as `/home/gc/backlinkV3.repo-merged-20260424-231004` may be useful for identifying the remote or previous commits, but do not treat them as the active source without checking current status.
+
+## D1 / Parallel-State Notes
+
+- Default store for this skill is Cloudflare D1. Unless the user explicitly asks for local/file-backed state, every operator/queue/inspection command must run with `BACKLINKHELPER_STORE=d1 BACKLINKHELPER_D1_DATABASE_NAME=backlinkhelper-v3`.
+- Do not ask the user for D1 database ID, database user, password, or table schema in normal use. The runtime uses `wrangler d1 execute backlinkhelper-v3 --remote` with the machine's configured Cloudflare credentials; schema is owned by `assets/backlinkhelper/src/memory/sql-schema.ts`.
+- For remote D1 bulk imports via `wrangler d1 execute ... --file`, keep the SQL file statement-only. Do **not** wrap it in explicit `BEGIN TRANSACTION` / `COMMIT`; remote execution can fail on transaction statements even when the insert SQL itself is valid.
+- Important split-brain caveat: some current promoted-profile commands are still file-backed, not D1-backed. In particular, `init-gate`, `missing-input-preflight`, and `update-promoted-dossier` currently read/write `~/.hermes/state/backlinkhelper-v3/profiles/<hostname>.json` via `getProfileFilePath()/writeJsonFile()` rather than the `promoted_profiles` D1 table. When D1 queue state is empty but those commands still know the promoted site, diagnose both the D1 tables and the file-backed promoted-profile state explicitly instead of assuming D1 already contains the profile row.
+- Before queue work in a fresh session, use D1 smoke checks carefully from `/home/gc/backlinkV3/assets/backlinkhelper`: `BACKLINKHELPER_STORE=d1 BACKLINKHELPER_D1_DATABASE_NAME=backlinkhelper-v3 node dist/cli/index.js db-smoke` after `corepack pnpm build` if source changed. Verify smoke rows cannot enter production intake: db-smoke/example.com target rows must be skipped/ignored, never left as `candidate`, because unattended-scope-tick may otherwise enqueue the fake `https://example.com/backlink-submit` target. If smoke pollution is found in production D1, clean both layers: mark all `db-smoke` / `example.com/backlink-submit` tasks `SKIPPED`, clear retry/cooldown/wait fields and worker leases, mark the matching `target_sites` row `skipped`, then dry-run the promoted scope to confirm it moves past cooldown into a real next task.
+- If the user asks to submit backlinks using D1 data and `claim-next-task` / `guarded-drain-status` returns idle or zero scoped tasks, do not stop and ask whether to inspect SQL vs queue cause. Immediately inspect D1 raw state for the promoted scope (`backlink_tasks`, `promoted_profiles`, `worker_leases`) plus the global `target_sites` candidate pool, diagnose scope/canonical URL mismatch vs missing enqueue, then enqueue/claim the next eligible `target_sites` candidate when safe.
+- Exact promoted scope is an invariant, not a fuzzy hint. For unattended or cron runs, freeze the user-provided promoted site as an exact canonical URL/hostname pair before the first queue command, and abort if later prompts, stale task state, or previous session context drift from that pair (for example `.com` vs `.io`). Never silently substitute a sibling domain/TLD just because `task-id-prefix` matches.
+- Before any enqueue / claim / operator submit / finalization step in unattended mode, re-check that the live scope still matches the user’s exact promoted URL and hostname. If any artifact, pending-finalize payload, expected_target_url, or verification target points at a different domain/TLD than the user specified, stop and report a scope mismatch instead of submitting or finalizing.
+- When stopping an unattended cron/operator run, verify shutdown from the scheduler (`cronjob list`) instead of inferring from chat messages alone. Old deliveries and files under `~/.hermes/cron/output/<job_id>/` can still exist after removal, and a just-finished in-flight run may still deliver once; do not mistake those historical outputs for an active job.
+- Do **not** run bare / unscoped `claim-next-task` when the user asked for a specific promoted site. First lock scope with `init-gate --promoted-url <exact-url>` and preferably `unattended-scope-tick --promoted-url <exact-url> --dry-run` (or scoped `claim-next-task --promoted-url/--promoted-hostname`) so the queue cannot accidentally claim another promoted site’s READY task.
+- If an accidental unscoped claim still happens, treat it as an operator mistake and revert immediately before any browser work: inspect the active lease + claimed task, restore the task to `lease.previous_status` (usually `READY`), clear `lease_expires_at`, restore previous wait/terminal fields if present, append a note that the claim was reverted without execution, then clear the active worker lease and pending-finalize payload. Verify the active lease is gone before resuming the intended promoted scope.
+- `target_sites` is a global target pool, not promoted-site-scoped. Do not require a target_sites row to already reference the promoted hostname. For a fixed promoted-url run, choose safe global candidates from `target_sites` and enqueue them with that promoted-url, while still respecting exact-host duplicate checks and active-lane/lease safeguards.
+- A promoted scope status like `guarded-drain-status --promoted-hostname <host>` only reports tasks already bound/enqueued for that promoted site; it is **not** the full available submission URL pool. If the scoped report shows only a few tasks or `untouched_ready: 0`, still inspect/use the global `target_sites` ready pool and continue unattended intake unless a real blocker exists.
+- Treat `needs_manual_boundary` / `no_candidate` from a bounded unattended tick as provisional until you verify the global `target_sites` pool with a sufficiently wide scan window. A small default `--candidate-limit` can create a false “no safe candidate” boundary when the first page of candidates is unsuitable but later candidates are safe. Re-run `unattended-scope-tick --promoted-url <exact-url> --candidate-limit 500 --dry-run --json` (or set `BACKLINKHELPER_CANDIDATE_LIMIT`) and compare `candidate_pool` / `safe_candidates` before telling the user the pool is exhausted.
+- Seed/import command exists: `node dist/cli/index.js import-backlink-csv --csv <file> --limit <n> [--enqueue --promoted-url <url>]`; large D1 bulk seeds are faster via generated SQL + `wrangler d1 execute --file` than one row per CLI call.
+- When bulk-importing into remote D1 via `wrangler d1 execute --file`, do **not** wrap the file with `BEGIN TRANSACTION` / `COMMIT`; Wrangler rejects SQL transaction statements in this path. Emit plain `INSERT OR IGNORE` / `INSERT ... ON CONFLICT` statements instead.
+- When reporting per-task completion speed, do not assume `DONE` is the only conclusion-level state. Unless the user explicitly asks for successful submissions only, include all tasks whose `updated_at` falls in the requested local-time window and whose status is no longer active queue: exclude `READY` / `RUNNING`; include `DONE`, `SKIPPED`, `WAITING_SITE_RESPONSE`, `WAITING_EXTERNAL_EVENT`, `WAITING_MANUAL_AUTH`, `WAITING_MISSING_INPUT`, `WAITING_POLICY_DECISION`, `WAITING_RETRY_DECISION`, and `RETRYABLE`. Convert Asia/Shanghai day windows to UTC for D1 ISO timestamps. Report two timing views: lifecycle time `created_at → updated_at`, and execution time `payload_json.stage_timestamps.claimed_at → updated_at` when `claimed_at` exists. `WAITING_RETRY_DECISION` / `RETRYABLE` can heavily skew lifecycle means because `src/control-plane/task-queue.ts` currently has `RETRY_BACKOFF_MS = 60 * 60 * 1_000` and `MAX_AUTOMATIC_RETRIES = 1`; these are often queue/cooldown delays rather than real operator execution time. For slow retry conclusions, break down `queue_wait = claimed_at - created_at` vs `after_claim = updated_at - claimed_at`, and inspect `wait.wait_reason_code`, `terminal_class`, `run_count`, `phase_history`, and local scout/finalization artifacts to separate site failures from CDP/runtime failures.
+
 ## Runtime Pitfalls To Remember
 
 - CapSolver 只能证明“验证码已解并已回填/尝试提交”，不能证明“点到了正确的提交按钮”。对有站内搜索、newsletter、multi-form 混排的页面，submit selector 必须优先收敛到当前目标表单（例如 `form#commentform`、`#commentform input#submit`、`form[action*="comment"]`），不要用过宽的全页 `input[type="submit"]` / `button[type="submit"]` 兜底顺序放前面。
+- 当前 suika watchdog 脚本仍硬编码 `node scripts/suika-blogger-operator.mjs`。语义层支持 `wp_comment` / `forum_profile` / `saas_directory` 不等于当前 concrete operator 都能执行；非 Blogger comment 目标必须先实现/接入对应 operator dispatcher，否则会被错误地按 Blogger frame 路径处理并跳成 `no_comment_surface`。明显的 forum/thread URL（如 `/forum/`, `viewtopic`, `showthread`, `thread=`）不要再当 `wp_comment` 候选硬跑；当前应降权/跳过，等 `forum_post`/profile dispatcher 接好后再进入对应 family。
 - 如果验证码 solve 成功后页面却跳到明显无关页面（如站内搜索 `?s=`、首页订阅确认、其他非目标表单落点），先怀疑“submit 命中错表单”，不要误判成 CapSolver 失败或站点拒绝。
 - 对 comment family，验收要拆成两层：`captcha/submit path passed` 与 `comment/backlink live`。出现 `#comment-...` 只能说明提交流程大概率接受，仍要 fresh reload 做 live/backlink 验证，避免把 moderation pending 误报为成功。
+- 锚文本/评论正文不能固定模板化。对同一 promoted URL，执行器必须在运行时选择自然锚文本并记录实际使用值，避免连续重复 exact anchor（例如每条都用 `Suika Game`）。优先由本轮 agent 基于页面标题/正文摘录/评论语境临时生成自然评论与 anchor，再用确定性 guardrails 校验；不要只做固定模板池随机轮换。curated pool 只能作为 fallback/anchor 候选约束，不是正文模板。锚文本应混合品牌/部分匹配/泛化描述/naked URL，例如品牌词、`fruit-merging puzzle`、`simple browser puzzle`、`this casual game`、裸链等，并避免同一 anchor 在最近若干成功链接中连续复用。cron 是独立会话，所以跨轮去重/相似度/配额不能依赖聊天上下文，必须读写 repo/D1 中的 task/link history、generated-copy history 或 promoted-profile 配置。当前 Suika Blogger operator 已实现 runtime copy planner：`scripts/suika-blogger-operator.mjs` 会从 D1 `DONE` 历史提取最近 anchors/comment previews，默认用 `hermes chat -Q` 临时生成 JSON；可用 `BACKLINKHELPER_COPY_AI_BACKEND=codex` 切 Codex、`BACKLINKHELPER_COPY_MODE=fallback` 强制 fallback。guardrails 要求恰好 1 个 promoted link、anchor 与链接文本一致、不能复用最近 anchor、英文 campaign 不接受非 Latin anchor、正文长度和垃圾短语检查通过。
+- 登录/注册墙不是天然 manual-auth。先区分可自动恢复的邮箱验证码 / magic link / confirmation mail / 受支持 CAPTCHA，与不可自动处理的手机号、passkey、账号锁定、明确 user-only approval 或当前 solver 不支持/配置缺失的验证。只要 runtime 邮箱能力可用（`gog` 或 Google Workspace `gws` fallback），邮箱验证边界应进入 mailbox/follow-up continuation；只要 CapSolver/solver API 可用且类型受支持，CAPTCHA 边界应先走 solver continuation，而不是直接终态 `WAITING_MANUAL_AUTH`。Blogger/Google-login 场景可使用共享 Chrome 中用户授权的专用 Google 登录态；Google 登录按钮本身不是 manual-auth blocker，operator 应优先点 iframe 内 `[role="button"][aria-label="Sign in with Google"]` / `div[role="button"]:has-text("Sign in with Google")` 等真实按钮；点击后若主页面跳到 `www.blogger.com/comment/login/...`，等待登录态生效后回到原 target 重新探测 comment iframe。只有额外 password/2FA/verify-it's-you/手机号/账号锁定才算人工边界。
+- scout/prepare 阶段发现可提取 sitekey 的 reCAPTCHA/Turnstile 时，不要前置终停为 `WAITING_POLICY_DECISION/CAPTCHA_BLOCKED`；应让 operator/finalize 有机会调用 solver。只有 solver 未配置、类型不支持、sitekey 缺失或 solve/回填失败后，才作为该 task 的 blocker 写回证据。
 
 ## Strategy Philosophy
 
@@ -83,6 +131,26 @@ active lane 很贵。
 
 不要为了“顺手再看一页”去扩大操作面、制造 host drift 或脏状态。
 
+### 7. 无人值守 campaign 的停止条件必须覆盖全池
+
+当用户要求“持续自主提交 / 无人值守 / 帮我提交外链”时，不能把一个 scoped bounded tick 的结束误当成 campaign 结束。
+
+正确的 campaign 判断顺序是：
+- 先锁定 promoted URL / hostname 的精确 scope
+- 再区分 scoped bound tasks 与全局 `target_sites` candidate pool：scoped report 只代表已绑定任务，不代表可提交 URL 总池
+- 若 scoped 队列为空或仅剩冷却中的 `RETRYABLE`，仍要尝试从全局 `target_sites` 选择安全 candidate 并绑定到该 promoted scope
+- 每轮执行后继续跑 follow-up / mailbox continuation，再回到 intake/claim，直到出现真实停止条件
+
+真实 campaign 停止条件只包括：
+- 已达到用户给定数量/时间/预算边界
+- 无 active lease，scope 内无可执行任务，且全局 candidate pool 也无安全候选
+- 全局 runtime/store/scope 安全 blocker 会影响所有任务，例如 D1/Wrangler 不可用、共享 Chrome/Playwright/CDP 整体不可用、active lease/pending-finalize 状态污染且无法安全恢复、promoted scope/verification scope 不一致、promoted profile 缺少全局必需输入导致任何提交都不安全
+- 用户明确要求停
+
+单个 task 的 blocker 不是 campaign 停止条件。普通登录/注册墙本身也不是 blocker：只要可用邮箱注册、magic link、confirmation mail、受支持 CAPTCHA 或已有账号路径存在，应先走 account/mailbox/solver continuation。只有手机号/passkey、账号锁定、邀请制、明确人工审批、当前账号/邮箱/solver 能力无法覆盖的 auth，才算该 task 的人工边界。政策/付费墙、不可恢复 auth、单站点反爬/表单异常等，应把该 task 标成 `SKIPPED` / `WAITING_MANUAL_AUTH` / `WAITING_POLICY_DECISION` / `RETRYABLE` 等合适状态并写足证据，然后继续 claim/enqueue 下一个候选；只有当这些问题上升为“全池都无法安全继续”的全局 blocker 时，才暂停 campaign。
+
+最终汇报前必须同时说明：已提交成功数、scoped tasks 状态、全局 ready/candidate pool 是否仍可继续、以及邮箱/follow-up 是否有可自动恢复项。
+
 ## Minimal Complete Toolset
 
 这里只说明能力边界，不规定站点剧本。
@@ -103,6 +171,20 @@ repo state 是任务记忆，不是聊天记忆。
 - 给 READY / RETRYABLE 任务提供 queue priority score
 
 它是“先判断是否值得做”的系统能力，不是站点操作规则。
+
+### 2.5. Deterministic D1 intake / queue tick
+
+D1 scope inspection and candidate-to-task intake are deterministic runtime operations, not places for LLM improvisation.
+
+用途：
+- inspect promoted scope: `backlink_tasks`, `worker_leases`, `promoted_profiles`
+- inspect global `target_sites` candidate pool
+- decide whether an existing READY / retryable task can be claimed
+- when the scoped queue is idle and no live lease exists, select one safe global candidate and enqueue it with the fixed promoted-url
+- return a compact machine-readable action summary: `claimed`, `enqueued`, `blocked`, `cooldown`, `no_candidate`, or `needs_manual_boundary`
+- support `--dry-run` as a non-mutating preview: it must not claim leases, change task status/run_count, enqueue tasks, or mark `target_sites`
+
+This capability should live as a repo-native CLI/helper under `assets/backlinkhelper`, not as a long prose checklist in this skill. The LLM may choose strategy and interpret site evidence, but the D1 intake state machine must be script/CLI-backed.
 
 ### 3. Shared CDP browser + browser-use CLI
 
@@ -139,6 +221,8 @@ repo state 是任务记忆，不是聊天记忆。
 - resend 后的 exact query confirm
 
 优先把 continuation 写进 task state，再由下一轮 active / follow_up 继续。
+
+If a site stops at email verification / code / magic-link, do **not** classify it as `WAITING_MANUAL_AUTH` just because a mailbox step is needed. First use the repo mailbox continuation path (`mailbox-triage`, then `follow-up-tick` or equivalent task resume) and set wait ownership to mail automation (`gog` or the Google Workspace `gws` fallback) when available. Only mark manual auth for boundaries mail cannot solve, such as phone verification, human CAPTCHA that cannot be solved by configured services, locked account, or explicit user-only approval.
 
 ### 6. Finalization + verification
 
@@ -182,6 +266,8 @@ finalization 负责 authoritative 收口，不负责替 agent 发明成功故事
 
 `run-next` 只是 fail-fast 占位，不是生产主入口。
 
+`unattended-scope-tick` 是 scope/intake 控制面：负责 scoped claim、从全局 `target_sites` enqueue 新任务、返回 `claimed/enqueued/blocked/cooldown/no_candidate` 等动作；它本身不等于 browser worker runner。默认 campaign 主入口是 `unattended-campaign`：它要求用户提供精确 `--promoted-url`，规范化并锁定 URL/hostname，拒绝 hostname mismatch 与 `--lane follow_up`，然后串起 `unattended-scope-tick`（必要时二次 claim 刚 enqueue 的任务）→ `task-prepare` → operator/browser-use（通过依赖注入或 `--operator-command` 返回 AgentTraceEnvelope）→ `task-record-agent-trace` → `task-finalize` → `follow-up-tick/mailbox` → 下一轮 intake。live 模式必须有可用 operator/browser-use 产出 `AgentTraceEnvelope`；如果没有 operator，只允许 `--dry-run` 或无副作用 smoke，runner 应返回 `operator_unavailable` 并保持 `scope_ticks=0`，不能 claim、提交或改 D1 队列。旧 `drain-worker` 脚本仍明确 disabled，`run-next` 仍只是 fail-fast 占位。
+
 ### 2. 当前 active work 仍然是单槽串行
 
 现在不考虑并行扩容。
@@ -190,6 +276,7 @@ finalization 负责 authoritative 收口，不负责替 agent 发明成功故事
 - 降低热路径固定开销
 - 提前拦住坏目标 / 重复目标
 - 提高单槽 active 的利用率
+- 避免把 cron 调度间隔变成吞吐瓶颈：持续 campaign 应采用“单槽热循环/长跑 drain”（一个任务完成后立即 claim 下一个，直到队列/候选池真实 idle、达到时间/数量上限或遇到 campaign 级 blocker），cron 只做保活/重启 watchdog；不要在高供给候选池下长期固定 `BACKLINKHELPER_LOOP_ITERS=1`，否则会退化成每个 cron 周期只处理一个任务。热循环必须带 runtime lock + heartbeat + stale recovery + idle/runtime/iteration budget，防止 cron overlap 变成隐性并发。
 
 ### 3. queue identity 现在按 promoted host + target exact host 守护
 
@@ -249,16 +336,11 @@ duplicate preflight 是 **exact-host** 口径：
 - bounded tick 汇报里应把它报告成 runtime blocker，而不是 queue empty
 - 若本轮用户要求“claim exactly one task”，在这种情况下应停在单行状态，不要强行挑第二条路径绕过状态机
 
-### 9. queue scope 里的 `promotedUrl` 是精确字符串匹配，不是规范化 URL 语义
+### 9. 底层 task scope 仍存在精确字符串匹配边界
 
-当前 `matchesTaskScope()` 直接比较 `task.submission.promoted_profile.url === scope.promotedUrl`。
+底层 `matchesTaskScope()` 仍直接比较 `task.submission.promoted_profile.url === scope.promotedUrl`；旧 bounded CLI 若传入的尾斜杠形式与任务里保存的不一致，可能排除本来同站点的任务。
 
-这意味着像 `https://geometrydashjp.com` 与 `https://geometrydashjp.com/` 这种尾斜杠差异，会把本来属于同一 promoted site 的任务错误排除在 scope 外。
-
-做 bounded status / follow-up / claim scoped run 时：
-- 若未先确认 repo 里保存的 canonical promoted URL 形式，优先用 `task-id-prefix + promoted-hostname`
-- 不要把 `--promoted-url` 当成天然安全的 scope 收窄器
-- 若必须带 `--promoted-url`，先确认 task state 里的精确字符串
+当前默认 campaign 入口 `unattended-campaign` 会把用户给的 `--promoted-url` 规范化并锁成 URL/hostname pair，再用这对 scope 贯穿 intake、follow-up、operator context，并在 claim 后重新校验 task 的 promoted profile。若手动跑更底层的 bounded status / claim / follow-up 命令，仍要先确认 repo 里保存的 canonical promoted URL 字符串；不确定时用 dry-run 或 D1 inspection 验证，避免把尾斜杠/协议差异误判成无任务。
 
 ### 9. `guarded-drain-status` 不是纯只读状态查看
 
@@ -285,10 +367,30 @@ duplicate preflight 是 **exact-host** 口径：
 - 先读 `package.json`、`dist/cli/index.js` 或对应命令实现，再执行真正的命令
 - 若误触发 claim / lease，先做 authoritative state restore，再继续本轮 bounded tick
 
+### 10. `update-promoted-dossier` 不等于 init-gate 一定放行
+
+有一个容易踩坑的 split：
+
+- `update-promoted-dossier --set ...` 会稳定写入 `profile.dossier_fields`
+- 但 `missing-input-preflight` / `init-gate` 的 core completeness 还会直接看 profile 顶层字段，例如 `profile.company_name`、`profile.contact_email`、`profile.primary_category`
+
+因此实战里可能出现这种现象：
+
+- `update-promoted-dossier` 已经把 `company_name` / `contact_email` / `primary_category` 写进 dossier fields
+- 但 `init-gate --mode unattended` 仍继续报这些 core 字段缺失（尤其 `primary_category`）
+
+遇到这种情况不要误判成 CLI 没生效，也不要直接开始 claim-next-task。正确做法是：
+
+- 先读 `~/.hermes/state/backlinkhelper-v3/profiles/<hostname>.json`
+- 同时核对顶层字段与 `dossier_fields`
+- 若 core 值只存在于 `dossier_fields`、缺在顶层，则先把 profile 顶层补齐，再重跑 `init-gate`
+
+判断标准：只有 `init-gate` 返回 core ready / flow ready 满足 unattended 条件后，才能把它当成真正可无人值守开跑；`update-promoted-dossier` 成功本身不构成这个保证。
+
 ## Safety Boundaries
 
 - 不付费，不购买 sponsored listing，不替用户做 payment step。
-- 不代做 2FA / passkey / 人工验证码设备操作。
+- 不代做 2FA / passkey / 需要用户设备或人工身份参与的验证；但受支持的 CAPTCHA 应优先走已配置 solver（例如 CapSolver API），不要误报为人工边界。
 - 不为了提速而绕过 lease、状态机、finalization、evidence writeback。
 - 不把 source-only tmp helper 当作站点决策器。
 - 不在 host drift、tab drift、page drift 明显时写入 authoritative verifier 结论。
@@ -314,6 +416,7 @@ duplicate preflight 是 **exact-host** 口径：
 - `references/runtime-failure-taxonomy.md`
 - `references/throughput-diagnostics.md`
 - `references/non-parallel-optimization-plan.md`
+- `references/db-before-parallel-expansion.md`
 - `references/runtime-known-gaps.md`
 - `references/capsolver-unattended.md`
 

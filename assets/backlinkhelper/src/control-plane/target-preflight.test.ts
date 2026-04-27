@@ -80,6 +80,22 @@ test("buildTargetPreflightAssessment incorporates exact-host history without col
   assert.equal(assessment.historical_fast_fail_count, 1);
 });
 
+test("wp_comment preflight rejects obvious forum/thread URLs instead of treating them as article comments", () => {
+  const assessment = buildTargetPreflightAssessment({
+    targetUrl: "https://cyberlord.at/forum/?id=1&thread=6857",
+    promotedHostname: "suikagame.fun",
+    flowFamily: "wp_comment",
+  });
+
+  assert.equal(assessment.viability, "deprioritized");
+  assert.ok(assessment.queue_priority_score < 40);
+  assert.ok(
+    assessment.signals.some((signal) =>
+      signal.detail.includes("Forum/thread URL should not be treated as a wp_comment surface"),
+    ),
+  );
+});
+
 test("findExactHostDuplicateTasks only matches the same promoted hostname and exact target hostname", () => {
   const matches = findExactHostDuplicateTasks({
     tasks: [

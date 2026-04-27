@@ -51,6 +51,13 @@ export interface GuardedDrainSystemStatusReport {
   status_counts: Record<string, number>;
   wait_reason_top: Array<{ reason: string; count: number }>;
   repeat_failure_host_top: Array<{ hostname: string; count: number }>;
+  latest_claim_timing: {
+    samples: number;
+    avg_total_minutes: number;
+    avg_queue_or_cooldown_minutes: number;
+    avg_latest_claim_execution_minutes: number;
+    max_latest_claim_execution_minutes: number;
+  };
 }
 
 export interface GuardedDrainRuntimeObservabilityReport {
@@ -78,6 +85,55 @@ export interface GuardedDrainStatusPayload {
   };
   browser_ownership?: unknown;
   blockers: string[];
+}
+
+function roundMinutes(value: number): number {
+  return Number(value.toFixed(2));
+}
+
+function buildLatestClaimTimingReport(tasks: TaskRecord[]): GuardedDrainSystemStatusReport["latest_claim_timing"] {
+  const samples = tasks
+    .map((task) => {
+      const createdAt = new Date(task.created_at).getTime();
+      const updatedAt = new Date(task.updated_at).getTime();
+      const claimedAt = task.stage_timestamps?.claimed_at
+        ? new Date(task.stage_timestamps.claimed_at).getTime()
+        : Number.NaN;
+      if (![createdAt, updatedAt, claimedAt].every(Number.isFinite)) {
+        return undefined;
+      }
+      const totalMs = Math.max(0, updatedAt - createdAt);
+      const latestClaimExecutionMs = Math.max(0, updatedAt - claimedAt);
+      return {
+        totalMinutes: totalMs / 60_000,
+        latestClaimExecutionMinutes: latestClaimExecutionMs / 60_000,
+        queueOrCooldownMinutes: Math.max(0, totalMs - latestClaimExecutionMs) / 60_000,
+      };
+    })
+    .filter((sample): sample is {
+      totalMinutes: number;
+      latestClaimExecutionMinutes: number;
+      queueOrCooldownMinutes: number;
+    } => Boolean(sample));
+
+  if (samples.length === 0) {
+    return {
+      samples: 0,
+      avg_total_minutes: 0,
+      avg_queue_or_cooldown_minutes: 0,
+      avg_latest_claim_execution_minutes: 0,
+      max_latest_claim_execution_minutes: 0,
+    };
+  }
+
+  const sum = (values: number[]) => values.reduce((total, value) => total + value, 0);
+  return {
+    samples: samples.length,
+    avg_total_minutes: roundMinutes(sum(samples.map((sample) => sample.totalMinutes)) / samples.length),
+    avg_queue_or_cooldown_minutes: roundMinutes(sum(samples.map((sample) => sample.queueOrCooldownMinutes)) / samples.length),
+    avg_latest_claim_execution_minutes: roundMinutes(sum(samples.map((sample) => sample.latestClaimExecutionMinutes)) / samples.length),
+    max_latest_claim_execution_minutes: roundMinutes(Math.max(...samples.map((sample) => sample.latestClaimExecutionMinutes))),
+  };
 }
 
 function buildSystemStatusReport(tasks: TaskRecord[]): GuardedDrainSystemStatusReport {
@@ -124,6 +180,7 @@ function buildSystemStatusReport(tasks: TaskRecord[]): GuardedDrainSystemStatusR
     status_counts: statusCounts,
     wait_reason_top: waitReasonTop,
     repeat_failure_host_top: repeatFailureHostTop,
+    latest_claim_timing: buildLatestClaimTimingReport(tasks),
   };
 }
 

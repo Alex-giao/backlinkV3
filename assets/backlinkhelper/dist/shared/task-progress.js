@@ -466,9 +466,84 @@ function actionLabelFromObservation(args) {
         args.url ??
         args.action.replace(/_/g, " "));
 }
+function normalizeTraceAction(action) {
+    switch (action) {
+        case "open_url":
+        case "click_index":
+        case "input_index":
+        case "select_index":
+        case "keys":
+        case "wait":
+        case "finish_submission_attempt":
+        case "classify_terminal":
+        case "abort_retryable":
+            return action;
+        case "open_target":
+            return "open_url";
+        case "fill_comment":
+            return "input_index";
+        case "select_identity":
+        case "click_publish":
+            return "click_index";
+        case "verify_public_page":
+            return "finish_submission_attempt";
+        case "inspect_comment_frame":
+        default:
+            return "wait";
+    }
+}
+function normalizeTraceStep(args) {
+    const raw = args.rawStep;
+    const legacyAction = typeof raw.action === "string" ? raw.action : undefined;
+    const legacyUrl = typeof raw.url === "string"
+        ? raw.url
+        : typeof raw.frame_url === "string"
+            ? raw.frame_url
+            : undefined;
+    const legacyTitle = typeof raw.title === "string" ? raw.title : undefined;
+    const legacyText = typeof raw.excerpt === "string"
+        ? raw.excerpt
+        : typeof raw.summary === "string"
+            ? raw.summary
+            : typeof raw.detail === "string"
+                ? raw.detail
+                : undefined;
+    const fallbackUrl = legacyUrl ?? args.handoff.current_url ?? args.trace.final_url;
+    const fallbackTitle = legacyTitle ?? args.trace.final_title ?? "";
+    const fallbackText = legacyText ?? args.trace.final_excerpt ?? "";
+    const observation = raw.observation ?? {
+        url: fallbackUrl,
+        title: fallbackTitle,
+        raw_text_excerpt: fallbackText,
+        elements: [],
+    };
+    const decision = raw.decision ?? {
+        action: normalizeTraceAction(legacyAction),
+        url: fallbackUrl,
+        text: legacyAction?.replace(/_/g, " "),
+        reason: legacyAction ? `legacy operator step: ${legacyAction}` : "legacy operator step",
+        confidence: 0.7,
+        expected_signal: "operator_step_recorded",
+        stop_if_observed: [],
+    };
+    const execution = raw.execution ?? {
+        ok: true,
+        detail: fallbackText || legacyAction?.replace(/_/g, " ") || "operator step recorded",
+        before_url: observation.url,
+        after_url: fallbackUrl,
+        duration_ms: 0,
+    };
+    return {
+        step_number: typeof raw.step_number === "number" ? raw.step_number : args.index + 1,
+        observation,
+        decision,
+        execution,
+    };
+}
 export function updateTaskExecutionStateFromTrace(args) {
     const state = ensureExecutionState(args.task);
-    args.trace.steps.forEach((step, index) => {
+    args.trace.steps.forEach((rawStep, index) => {
+        const step = normalizeTraceStep({ rawStep, index, trace: args.trace, handoff: args.handoff });
         const fromContextType = inferContextType({
             url: step.observation.url,
             title: step.observation.title,

@@ -235,6 +235,38 @@ test("trace update records discovered actions, oauth fragment, and form frontier
   assert.ok(task.execution_state?.reusable_fragments.some((item) => item.fragment_id === "frag_google_oauth_gate_v1"));
 });
 
+test("trace update accepts legacy lightweight operator steps", () => {
+  const task = makeTask({ flow_family: "wp_comment" });
+  const trace = {
+    ...makeTrace(),
+    final_url: "https://blog.example.com/post/1",
+    final_title: "Blog post",
+    final_excerpt: "No Blogger comment frame found",
+    steps: [
+      { action: "open_target", url: "https://blog.example.com/post/1", title: "Blog post" },
+      { action: "inspect_comment_frame", frame_url: "https://www.blogger.com/comment/frame", excerpt: "sign in required" },
+    ],
+  } as unknown as AgentLoopTrace;
+
+  assert.doesNotThrow(() =>
+    updateTaskExecutionStateFromTrace({
+      task,
+      trace,
+      handoff: {
+        detail: "No Blogger comment frame found on target page.",
+        artifact_refs: ["/tmp/agent-loop.json"],
+        current_url: "https://blog.example.com/post/1",
+        recorded_steps: [],
+        agent_trace_ref: "/tmp/agent-loop.json",
+        agent_backend: "hermes-operator/suika-blogger-playwright",
+        agent_steps_count: 2,
+      },
+    }),
+  );
+  assert.equal(task.execution_state?.discovered_actions.length, 2);
+  assert.equal(task.execution_state?.frontier?.url, "https://blog.example.com/post/1");
+});
+
 test("outcome update stores blocker metadata and preserves retry budget for visual verification", () => {
   const task = makeTask();
   const wait: WaitMetadata = {

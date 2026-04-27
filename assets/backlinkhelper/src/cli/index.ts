@@ -1,7 +1,9 @@
 import { pathToFileURL } from "node:url";
 
 import { runClaimNextTaskCommand } from "./claim-next-task.js";
+import { runDbSmokeCommand } from "./db-smoke.js";
 import { runEnqueueSiteCommand } from "./enqueue-site.js";
+import { runImportBacklinkCsvCommand } from "./import-backlink-csv.js";
 import { runFollowUpTickCommand } from "./follow-up-tick.js";
 import { runGuardedDrainStatusCommand } from "./guarded-drain-status.js";
 import { runInitGateCommand } from "./init-gate.js";
@@ -14,6 +16,8 @@ import { runStartBrowserCommand } from "./start-browser.js";
 import { runTaskFinalizeCommand } from "./task-finalize.js";
 import { runTaskPrepareCommand } from "./task-prepare.js";
 import { runTaskRecordAgentTraceCommand } from "./task-record-agent-trace.js";
+import { runUnattendedCampaignCommand } from "./unattended-campaign-runner.js";
+import { runUnattendedScopeTickCommand } from "./unattended-scope-tick.js";
 import { runUpdatePromotedDossierCommand } from "./update-promoted-dossier.js";
 
 function readFlag(argv: string[], flagName: string): string | undefined {
@@ -79,9 +83,13 @@ export const SUPPORTED_COMMANDS = [
   "start-browser",
   "preflight",
   "enqueue-site",
+  "db-smoke",
+  "import-backlink-csv",
   "guarded-drain-status",
   "mailbox-triage",
   "follow-up-tick",
+  "unattended-campaign",
+  "unattended-scope-tick",
   "missing-input-preflight",
   "init-gate",
   "update-promoted-dossier",
@@ -124,6 +132,25 @@ async function main(): Promise<void> {
         enqueuedBy: readFlag(rest, "--enqueued-by"),
       });
       return;
+    case "db-smoke":
+      await runDbSmokeCommand();
+      return;
+    case "import-backlink-csv":
+      await runImportBacklinkCsvCommand({
+        csvPath: requireFlag(rest, "--csv"),
+        urlColumn: readFlag(rest, "--url-column"),
+        source: readFlag(rest, "--source"),
+        limit: readOptionalInt(rest, "--limit"),
+        offset: readFlag(rest, "--offset") ? Number(readFlag(rest, "--offset")) : undefined,
+        flowFamily: readFlag(rest, "--flow-family") as "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog" | undefined,
+        enqueue: readBooleanFlag(rest, "--enqueue"),
+        promotedUrl: readFlag(rest, "--promoted-url"),
+        promotedName: readFlag(rest, "--promoted-name"),
+        promotedDescription: readFlag(rest, "--promoted-description"),
+        submitterEmailBase: readFlag(rest, "--submitter-email-base"),
+        taskIdPrefix: readFlag(rest, "--task-id-prefix"),
+      });
+      return;
     case "guarded-drain-status":
       await runGuardedDrainStatusCommand({
         cdpUrl,
@@ -152,6 +179,47 @@ async function main(): Promise<void> {
         taskIdPrefix: readFlag(rest, "--task-id-prefix"),
         promotedHostname: readFlag(rest, "--promoted-hostname"),
         promotedUrl: readFlag(rest, "--promoted-url"),
+      });
+      return;
+    case "unattended-campaign":
+      await runUnattendedCampaignCommand({
+        owner: readFlag(rest, "--owner") ?? "unattended-campaign-worker",
+        lane: readFlag(rest, "--lane") as "active_any" | "directory_active" | "non_directory_active" | "follow_up" | undefined,
+        taskIdPrefix: readFlag(rest, "--task-id-prefix"),
+        promotedHostname: readFlag(rest, "--promoted-hostname"),
+        promotedUrl: readFlag(rest, "--promoted-url"),
+        promotedName: readFlag(rest, "--promoted-name"),
+        promotedDescription: readFlag(rest, "--promoted-description"),
+        submitterEmailBase: readFlag(rest, "--submitter-email-base"),
+        confirmSubmit: readBooleanFlag(rest, "--confirm-submit"),
+        flowFamily: readFlag(rest, "--flow-family") as "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog" | undefined,
+        candidateLimit: readOptionalInt(rest, "--candidate-limit"),
+        cdpUrl,
+        dryRun: readBooleanFlag(rest, "--dry-run"),
+        maxActiveTasks: readOptionalInt(rest, "--max-active-tasks"),
+        maxScopeTicks: readOptionalInt(rest, "--max-scope-ticks"),
+        maxFollowUpTicks: readOptionalInt(rest, "--max-follow-up-ticks"),
+        followUp: readBooleanFlag(rest, "--no-follow-up") ? false : undefined,
+        operatorCommand: readFlag(rest, "--operator-command") ?? process.env.BACKLINKHELPER_OPERATOR_COMMAND,
+        operatorTimeoutMs: readFlag(rest, "--operator-timeout-ms")
+          ? Number(readFlag(rest, "--operator-timeout-ms"))
+          : undefined,
+      });
+      return;
+    case "unattended-scope-tick":
+      await runUnattendedScopeTickCommand({
+        owner: readFlag(rest, "--owner") ?? "unattended-scope-worker",
+        lane: readFlag(rest, "--lane") as "active_any" | "directory_active" | "non_directory_active" | "follow_up" | undefined,
+        taskIdPrefix: readFlag(rest, "--task-id-prefix"),
+        promotedHostname: readFlag(rest, "--promoted-hostname"),
+        promotedUrl: readFlag(rest, "--promoted-url"),
+        promotedName: readFlag(rest, "--promoted-name"),
+        promotedDescription: readFlag(rest, "--promoted-description"),
+        submitterEmailBase: readFlag(rest, "--submitter-email-base"),
+        confirmSubmit: readBooleanFlag(rest, "--confirm-submit"),
+        flowFamily: readFlag(rest, "--flow-family") as "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog" | undefined,
+        candidateLimit: readOptionalInt(rest, "--candidate-limit"),
+        dryRun: readBooleanFlag(rest, "--dry-run"),
       });
       return;
     case "missing-input-preflight":
@@ -239,7 +307,11 @@ async function main(): Promise<void> {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
-    console.error(error instanceof Error ? error.message : error);
+    if (process.env.BACKLINKHELPER_DEBUG_STACK === "1" && error instanceof Error) {
+      console.error(error.stack ?? error.message);
+    } else {
+      console.error(error instanceof Error ? error.message : error);
+    }
     process.exitCode = 1;
   });
 }

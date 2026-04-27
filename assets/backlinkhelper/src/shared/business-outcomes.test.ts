@@ -104,6 +104,9 @@ test("family semantic contract declares live-link verification requirements", ()
 
 test("family semantic contract declares non-directory checkpoint reason codes", () => {
   assert.deepEqual(getFamilyConfig("forum_profile").semanticContract.pending_wait_reason_codes, ["PROFILE_PUBLICATION_PENDING"]);
+  assert.deepEqual(getFamilyConfig("forum_post").semanticContract.pending_wait_reason_codes, ["FORUM_POST_MODERATION_PENDING", "FORUM_POST_PUBLICATION_PENDING"]);
+  assert.deepEqual(getFamilyConfig("forum_post").semanticContract.review_wait_reason_codes, ["FORUM_POST_PUBLISHED_NO_LINK"]);
+  assert.deepEqual(getFamilyConfig("forum_post").semanticContract.policy_wait_reason_codes, ["FORUM_POST_ANTI_SPAM_BLOCKED"]);
   assert.deepEqual(getFamilyConfig("wp_comment").semanticContract.pending_wait_reason_codes, ["COMMENT_MODERATION_PENDING"]);
   assert.deepEqual(getFamilyConfig("wp_comment").semanticContract.review_wait_reason_codes, ["COMMENT_PUBLISHED_NO_LINK"]);
   assert.deepEqual(getFamilyConfig("wp_comment").semanticContract.policy_wait_reason_codes, ["COMMENT_ANTI_SPAM_BLOCKED"]);

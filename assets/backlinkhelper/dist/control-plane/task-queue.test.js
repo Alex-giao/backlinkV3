@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { buildRetryDecisionPlan, canRetry, deriveFlowFamilyAudit, deriveTaskLane, isRetryExhausted, matchesTaskScope, pickNextTaskForLane, parkExhaustedRetryableTask, resolveWorkerLeaseGroupForLane, shouldDeferHostReactivation, shouldReactivateRuntimeRetries, } from "./task-queue.js";
+import { buildRetryDecisionPlan, canRetry, deriveFlowFamilyAudit, getRetryReadyAt, deriveTaskLane, isRetryExhausted, matchesTaskScope, pickNextTaskForLane, parkExhaustedRetryableTask, resolveWorkerLeaseGroupForLane, shouldDeferHostReactivation, shouldReactivateRuntimeRetries, } from "./task-queue.js";
 function makeTask(overrides = {}) {
     return {
         id: "task-1",
@@ -35,6 +35,7 @@ function makeTask(overrides = {}) {
 test("deriveTaskLane routes active and waiting tasks into the expected logical lanes", () => {
     assert.equal(deriveTaskLane(makeTask({ status: "READY", run_count: 0, flow_family: "saas_directory" })), "directory_active");
     assert.equal(deriveTaskLane(makeTask({ status: "READY", run_count: 0, flow_family: "wp_comment" })), "non_directory_active");
+    assert.equal(deriveTaskLane(makeTask({ status: "READY", run_count: 0, flow_family: "forum_post" })), "non_directory_active");
     assert.equal(deriveTaskLane(makeTask({ status: "WAITING_SITE_RESPONSE", flow_family: "saas_directory" })), "follow_up");
     assert.equal(deriveTaskLane(makeTask({ status: "WAITING_EXTERNAL_EVENT", flow_family: "dev_blog" })), "follow_up");
     assert.equal(deriveTaskLane(makeTask({ status: "WAITING_MANUAL_AUTH", flow_family: "wp_comment" })), undefined);
@@ -55,6 +56,18 @@ test("deriveFlowFamilyAudit records explicit and defaulted family provenance for
     assert.equal(defaulted.flowFamily, "saas_directory");
     assert.equal(defaulted.flowFamilySource, "defaulted");
     assert.match(defaulted.flowFamilyReason, /defaulted to saas_directory/i);
+});
+test("deriveFlowFamilyAudit corrects dispatcher wp_comment hints on forum thread targets", () => {
+    const corrected = deriveFlowFamilyAudit({
+        requestedFlowFamily: "wp_comment",
+        targetUrl: "https://cyberlord.at/forum/?id=1&thread=6857",
+        enqueuedBy: "dispatcher",
+        now: "2026-04-21T00:00:00.000Z",
+    });
+    assert.equal(corrected.flowFamily, "forum_post");
+    assert.equal(corrected.flowFamilySource, "corrected");
+    assert.equal(corrected.correctedFromFamily, "wp_comment");
+    assert.match(corrected.flowFamilyReason, /forum\/thread/i);
 });
 test("deriveFlowFamilyAudit records corrected_from_family when re-enqueue changes the task family", () => {
     const corrected = deriveFlowFamilyAudit({
@@ -146,6 +159,35 @@ test("pickNextTaskForLane exposes lightweight site-response checkpoints to the f
         },
     });
     assert.equal(pickNextTaskForLane([unsupportedWaiting, siteResponseWaiting], "follow_up")?.id, "site-response-waiting");
+});
+test("pickNextTaskForLane exposes forum_post moderation checkpoints to the follow-up queue", () => {
+    const forumPostWaiting = makeTask({
+        id: "forum-post-waiting",
+        status: "WAITING_SITE_RESPONSE",
+        flow_family: "forum_post",
+        created_at: "2026-04-08T00:00:00.000Z",
+        wait: {
+            wait_reason_code: "FORUM_POST_MODERATION_PENDING",
+            resume_trigger: "Forum reply is awaiting moderator approval.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "artifact.json",
+        },
+    });
+    const unsupportedWaiting = makeTask({
+        id: "unsupported-waiting",
+        status: "WAITING_SITE_RESPONSE",
+        flow_family: "forum_post",
+        created_at: "2026-04-08T00:00:01.000Z",
+        wait: {
+            wait_reason_code: "UNKNOWN_PENDING_REASON",
+            resume_trigger: "Wait and see.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "artifact.json",
+        },
+    });
+    assert.equal(pickNextTaskForLane([unsupportedWaiting, forumPostWaiting], "follow_up")?.id, "forum-post-waiting");
 });
 test("pickNextTaskForLane prioritizes higher queue_priority_score before FIFO among READY active tasks", () => {
     const olderLowPriority = makeTask({
@@ -263,6 +305,84 @@ test("fresh retryable task remains eligible after backoff expires", () => {
     });
     assert.equal(isRetryExhausted(task), false);
     assert.equal(canRetry(task), true);
+});
+test("runtime retryables use short backoff while target-site outages keep the full cooldown", () => {
+    const now = Date.now();
+    const runtimeRetry = makeTask({
+        run_count: 1,
+        updated_at: new Date(now - 6 * 60 * 1_000).toISOString(),
+        wait: {
+            wait_reason_code: "SCOUT_SESSION_TIMEOUT",
+            resume_trigger: "Scout page release failed; reset the shared session before retry.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "scout.json",
+        },
+    });
+    const runtimeStillCooling = makeTask({
+        run_count: 1,
+        updated_at: new Date(now - 4 * 60 * 1_000).toISOString(),
+        wait: {
+            wait_reason_code: "SCOUT_SESSION_TIMEOUT",
+            resume_trigger: "Scout page release failed; reset the shared session before retry.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "scout.json",
+        },
+    });
+    const targetOutageRetry = makeTask({
+        run_count: 1,
+        updated_at: new Date(now - 6 * 60 * 1_000).toISOString(),
+        wait: {
+            wait_reason_code: "DIRECTORY_UPSTREAM_5XX",
+            resume_trigger: "Retry later after the directory becomes reachable again.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "scout.json",
+        },
+    });
+    assert.equal(canRetry(runtimeRetry), true);
+    assert.equal(canRetry(runtimeStillCooling), false);
+    assert.equal(canRetry(targetOutageRetry), false);
+    assert.equal(getRetryReadyAt(runtimeStillCooling), new Date(new Date(runtimeStillCooling.updated_at).getTime() + 5 * 60 * 1_000).toISOString());
+    assert.equal(getRetryReadyAt(targetOutageRetry), new Date(new Date(targetOutageRetry.updated_at).getTime() + 60 * 60 * 1_000).toISOString());
+});
+test("parking an exhausted runtime retryable keeps it in the runtime recovery pool instead of generic retry triage", () => {
+    const task = makeTask({
+        run_count: 2,
+        wait: {
+            wait_reason_code: "SCOUT_SESSION_TIMEOUT",
+            resume_trigger: "Retry later after resetting the shared CDP scout session.",
+            resolution_owner: "system",
+            resolution_mode: "auto_resume",
+            evidence_ref: "scout.json",
+        },
+    });
+    const parked = parkExhaustedRetryableTask(task);
+    assert.equal(parked, true);
+    assert.equal(task.status, "WAITING_RETRY_DECISION");
+    assert.equal(task.wait?.wait_reason_code, "RUNTIME_RECOVERY_REQUIRED");
+    assert.equal(task.terminal_class, "takeover_runtime_error");
+    assert.match(task.last_takeover_outcome ?? "", /runtime\/browser recovery/i);
+});
+test("runtime recovery waits reactivate only after the runtime health gate passes", async () => {
+    const task = makeTask({
+        status: "WAITING_RETRY_DECISION",
+        wait: {
+            wait_reason_code: "RUNTIME_RECOVERY_REQUIRED",
+            resume_trigger: "Runtime/browser recovery required after SCOUT_SESSION_TIMEOUT.",
+            resolution_owner: "none",
+            resolution_mode: "terminal_audit",
+            evidence_ref: "scout.json",
+        },
+    });
+    const unhealthyPlan = await buildRetryDecisionPlan(task, { healthy: false, summary: "playwright attach failed" });
+    assert.equal(unhealthyPlan.bucket, "runtime_recovery_pool");
+    assert.equal(unhealthyPlan.nextStatus, "WAITING_RETRY_DECISION");
+    assert.equal(unhealthyPlan.waitReasonCode, "RUNTIME_RECOVERY_REQUIRED");
+    const healthyPlan = await buildRetryDecisionPlan(task, { healthy: true, summary: "runtime ok" });
+    assert.equal(healthyPlan.bucket, "runtime_reactivate_ready");
+    assert.equal(healthyPlan.nextStatus, "READY");
 });
 test("runtime retry pool can be reactivated when the health gate passes", () => {
     assert.equal(shouldReactivateRuntimeRetries({ healthy: true, summary: "runtime ok" }), true);

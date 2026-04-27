@@ -191,6 +191,41 @@ test("guarded drain payload defaults to business outcome view, exposes lane coun
   assert.equal(payload.runtime_observability.circuit_breaker_open, false);
 });
 
+test("guarded drain timing report separates queue/backoff time from latest claimed execution time", () => {
+  const payload = buildGuardedDrainStatusPayload({
+    scope: {},
+    runtimeHealth: { healthy: true, summary: "runtime healthy" },
+    repair: { repaired: 0 },
+    tasks: [
+      makeTask({
+        status: "WAITING_RETRY_DECISION",
+        created_at: "2026-04-21T00:00:00.000Z",
+        updated_at: "2026-04-21T01:05:00.000Z",
+        stage_timestamps: {
+          claimed_at: "2026-04-21T01:00:00.000Z",
+        },
+        wait: {
+          wait_reason_code: "AUTOMATIC_RETRY_EXHAUSTED",
+          resume_trigger: "Automatic retry budget exhausted.",
+          resolution_owner: "none",
+          resolution_mode: "terminal_audit",
+          evidence_ref: "artifact.json",
+        },
+      }),
+    ],
+    followUpReport: buildFollowUpOutcomeReport([]),
+    blockers: [],
+  });
+
+  assert.deepEqual(payload.system_status_report.latest_claim_timing, {
+    samples: 1,
+    avg_total_minutes: 65,
+    avg_queue_or_cooldown_minutes: 60,
+    avg_latest_claim_execution_minutes: 5,
+    max_latest_claim_execution_minutes: 5,
+  });
+});
+
 test("guarded drain payload surfaces runtime observability for breaker, browser pollution, and last auto-recovery attempt", () => {
   const payload = buildGuardedDrainStatusPayload({
     scope: {},

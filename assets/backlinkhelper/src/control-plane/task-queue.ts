@@ -1,5 +1,6 @@
 import { loadOrCreatePromotedProfile } from "../shared/promoted-profile.js";
 import { getFamilyConfig, resolveFlowFamily } from "../families/index.js";
+import { classifyTargetFlowFamily } from "../families/classifier.js";
 import { buildTargetPreflightAssessment, findExactHostDuplicateTasks } from "./target-preflight.js";
 import {
   clearPendingFinalize,
@@ -32,6 +33,7 @@ import type {
 } from "../shared/types.js";
 
 const RETRY_BACKOFF_MS = 60 * 60 * 1_000;
+const RUNTIME_RETRY_BACKOFF_MS = 5 * 60 * 1_000;
 const MAX_AUTOMATIC_RETRIES = 1;
 const RETRY_EXHAUSTED_WAIT_REASON_CODE = "AUTOMATIC_RETRY_EXHAUSTED";
 const RUNTIME_RECOVERY_WAIT_REASON_CODE = "RUNTIME_RECOVERY_REQUIRED";
@@ -156,7 +158,13 @@ const REACTIVATE_REASON_CODES = new Set([
 const RUNTIME_REASON_CODES = new Set([
   "TASK_TIMEOUT",
   "TAKEOVER_RUNTIME_ERROR",
+  "FINALIZATION_SESSION_FAILED",
+  "CDP_RUNTIME_UNAVAILABLE",
+  "PLAYWRIGHT_CDP_UNAVAILABLE",
   "RUNTIME_PREFLIGHT_FAILED",
+  "SCOUT_SESSION_TIMEOUT",
+  "BROWSER_USE_CLI_UNAVAILABLE",
+  "GOG_UNAVAILABLE",
 ]);
 const DEFAULT_GUARDED_REACTIVATION_BUCKETS: RetryDecisionBucket[] = [
   "reactivate_ready",
@@ -171,6 +179,7 @@ export interface EnqueueSiteTaskResult {
 }
 
 export function deriveFlowFamilyAudit(args: {
+  targetUrl?: string;
   requestedFlowFamily?: TaskRecord["flow_family"];
   existingTask?: Pick<TaskRecord, "flow_family" | "corrected_from_family" | "enqueued_by">;
   enqueuedBy?: string;
@@ -185,24 +194,34 @@ export function deriveFlowFamilyAudit(args: {
 } {
   const now = args.now ?? new Date().toISOString();
   const enqueuedBy = args.enqueuedBy ?? args.existingTask?.enqueued_by ?? "enqueue-site";
-  const requested = resolveFlowFamily(args.requestedFlowFamily);
+  const classification = classifyTargetFlowFamily({
+    targetUrl: args.targetUrl,
+    requestedFlowFamily: args.requestedFlowFamily,
+  });
 
   if (!args.existingTask) {
-    const flowFamilySource: FlowFamilySource = args.requestedFlowFamily ? "explicit" : "defaulted";
     return {
-      flowFamily: requested,
-      flowFamilySource,
-      flowFamilyReason:
-        flowFamilySource === "explicit"
-          ? `Flow family ${requested} was supplied explicitly at enqueue time.`
-          : `No flow family was supplied at enqueue time; defaulted to ${requested}.`,
+      flowFamily: classification.flowFamily,
+      flowFamilySource: classification.source,
+      flowFamilyReason: classification.reason,
       flowFamilyUpdatedAt: now,
+      correctedFromFamily: classification.correctedFromFamily,
       enqueuedBy,
     };
   }
 
   const existingFamily = resolveFlowFamily(args.existingTask.flow_family);
   if (!args.requestedFlowFamily) {
+    if (classification.source === "inferred" && classification.flowFamily !== existingFamily) {
+      return {
+        flowFamily: classification.flowFamily,
+        flowFamilySource: "corrected",
+        flowFamilyReason: `Flow family corrected from ${existingFamily} to ${classification.flowFamily} from target URL classification. ${classification.reason}`,
+        flowFamilyUpdatedAt: now,
+        correctedFromFamily: existingFamily,
+        enqueuedBy,
+      };
+    }
     return {
       flowFamily: existingFamily,
       flowFamilySource: "carried_forward",
@@ -213,21 +232,32 @@ export function deriveFlowFamilyAudit(args: {
     };
   }
 
-  if (requested !== existingFamily) {
+  if (classification.flowFamily !== existingFamily) {
     return {
-      flowFamily: requested,
+      flowFamily: classification.flowFamily,
       flowFamilySource: "corrected",
-      flowFamilyReason: `Flow family corrected from ${existingFamily} to ${requested} during re-enqueue.`,
+      flowFamilyReason: `Flow family corrected from ${existingFamily} to ${classification.flowFamily} during re-enqueue. ${classification.reason}`,
       flowFamilyUpdatedAt: now,
       correctedFromFamily: existingFamily,
       enqueuedBy,
     };
   }
 
+  if (classification.source === "corrected") {
+    return {
+      flowFamily: classification.flowFamily,
+      flowFamilySource: "corrected",
+      flowFamilyReason: classification.reason,
+      flowFamilyUpdatedAt: now,
+      correctedFromFamily: classification.correctedFromFamily,
+      enqueuedBy,
+    };
+  }
+
   return {
-    flowFamily: requested,
+    flowFamily: classification.flowFamily,
     flowFamilySource: "explicit",
-    flowFamilyReason: `Flow family ${requested} was explicitly reaffirmed during re-enqueue.`,
+    flowFamilyReason: `Flow family ${classification.flowFamily} was explicitly reaffirmed during re-enqueue.`,
     flowFamilyUpdatedAt: now,
     correctedFromFamily: args.existingTask.corrected_from_family,
     enqueuedBy,
@@ -257,6 +287,7 @@ function buildTask(args: {
 }): TaskRecord {
   const now = new Date().toISOString();
   const familyAudit = deriveFlowFamilyAudit({
+    targetUrl: args.targetUrl,
     requestedFlowFamily: args.flowFamily,
     enqueuedBy: args.enqueuedBy,
     now,
@@ -331,7 +362,8 @@ function buildReenqueuedTaskFromExisting(args: {
   const targetHostname = new URL(args.targetUrl).hostname;
   let familyAudit;
   if (args.preserveExistingFlowFamilyWhenOmitted === false && !args.flowFamily) {
-    const defaultedFamily = resolveFlowFamily(args.flowFamily);
+    const classification = classifyTargetFlowFamily({ targetUrl: args.targetUrl });
+    const defaultedFamily = classification.flowFamily;
     const existingFamily = resolveFlowFamily(args.existingTask.flow_family);
     const enqueuedBy = args.enqueuedBy ?? args.existingTask.enqueued_by ?? "enqueue-site";
     familyAudit =
@@ -346,14 +378,15 @@ function buildReenqueuedTaskFromExisting(args: {
           }
         : {
             flowFamily: defaultedFamily,
-            flowFamilySource: "corrected" as const,
-            flowFamilyReason: `Flow family corrected from ${existingFamily} to ${defaultedFamily} because the new enqueue omitted flow family and default semantics apply.`,
+            flowFamilySource: classification.source === "inferred" ? "inferred" as const : "corrected" as const,
+            flowFamilyReason: `Flow family corrected from ${existingFamily} to ${defaultedFamily} because the new enqueue omitted flow family and target classification/default semantics apply. ${classification.reason}`,
             flowFamilyUpdatedAt: args.now,
             correctedFromFamily: existingFamily,
             enqueuedBy,
           };
   } else {
     familyAudit = deriveFlowFamilyAudit({
+      targetUrl: args.targetUrl,
       existingTask: args.existingTask,
       requestedFlowFamily: args.flowFamily,
       enqueuedBy: args.enqueuedBy,
@@ -455,6 +488,8 @@ const AUTO_RESUMABLE_FOLLOW_UP_REASON_CODES = new Set(["EMAIL_VERIFICATION_PENDI
 const LIGHTWEIGHT_SITE_RESPONSE_FOLLOW_UP_REASON_CODES = new Set([
   "SITE_RESPONSE_PENDING",
   "PROFILE_PUBLICATION_PENDING",
+  "FORUM_POST_MODERATION_PENDING",
+  "FORUM_POST_PUBLICATION_PENDING",
   "COMMENT_MODERATION_PENDING",
   "ARTICLE_SUBMITTED_PENDING_EDITORIAL",
   "ARTICLE_PUBLICATION_PENDING",
@@ -562,7 +597,20 @@ export function canRetry(task: TaskRecord): boolean {
     return false;
   }
 
-  return Date.now() - new Date(task.updated_at).getTime() >= RETRY_BACKOFF_MS;
+  return Date.now() >= new Date(getRetryReadyAt(task)).getTime();
+}
+
+function getRetryBackoffMs(task: Pick<TaskRecord, "wait">): number {
+  const waitReasonCode = task.wait?.wait_reason_code;
+  if (waitReasonCode && RUNTIME_REASON_CODES.has(waitReasonCode)) {
+    return RUNTIME_RETRY_BACKOFF_MS;
+  }
+
+  return RETRY_BACKOFF_MS;
+}
+
+export function getRetryReadyAt(task: Pick<TaskRecord, "updated_at" | "wait">): string {
+  return new Date(new Date(task.updated_at).getTime() + getRetryBackoffMs(task)).toISOString();
 }
 
 function inferExhaustedRetryReason(task: TaskRecord): string | undefined {
@@ -682,6 +730,21 @@ export function parkExhaustedRetryableTask(task: TaskRecord): boolean {
     };
     task.last_takeover_outcome = task.wait.resume_trigger;
     task.notes.push("Automatic retry exhaustion collapsed directly into WAITING_MISSING_INPUT.");
+    return true;
+  }
+
+  if (inferredReason && RUNTIME_REASON_CODES.has(inferredReason)) {
+    updateTaskStatus(task, "WAITING_RETRY_DECISION");
+    task.wait = {
+      wait_reason_code: RUNTIME_RECOVERY_WAIT_REASON_CODE,
+      resume_trigger: `${exhaustedDetail} Runtime/browser recovery is required before another automated attempt (${inferredReason}).`,
+      resolution_owner: "none",
+      resolution_mode: "terminal_audit",
+      evidence_ref: evidenceRef,
+    };
+    task.terminal_class = "takeover_runtime_error";
+    task.last_takeover_outcome = task.wait.resume_trigger;
+    task.notes.push("Automatic retry exhaustion moved to runtime-recovery pool.");
     return true;
   }
 
@@ -822,6 +885,10 @@ function inferReasonFromText(text: string, flowFamily?: TaskRecord["flow_family"
 }
 
 function hasRuntimeRecoveryBlocker(task: TaskRecord): boolean {
+  if (task.wait?.wait_reason_code === RUNTIME_RECOVERY_WAIT_REASON_CODE) {
+    return true;
+  }
+
   if (task.wait?.wait_reason_code !== RETRY_EXHAUSTED_WAIT_REASON_CODE) {
     return false;
   }

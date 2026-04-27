@@ -670,6 +670,13 @@ export function summarizeMissingInputPreflight(args: {
     ...resolvedFields.map((field) => field.key),
     ...autoResolvableFields.map((field) => field.key),
   ]);
+  if (args.profile?.dossier_fields) {
+    for (const [key, dossierField] of Object.entries(args.profile.dossier_fields)) {
+      if (dossierField?.value && dossierField.allowed_for_autofill) {
+        availableKeys.add(key);
+      }
+    }
+  }
   if (args.profile?.company_name || args.profile?.name) {
     availableKeys.add("company_name");
   }
@@ -678,6 +685,24 @@ export function summarizeMissingInputPreflight(args: {
   }
   if (args.profile?.primary_category || args.profile?.category_hints?.length) {
     availableKeys.add("primary_category");
+  }
+  if (args.profile?.country) {
+    availableKeys.add("country");
+  }
+  if (args.profile?.state_province) {
+    availableKeys.add("state_province");
+  }
+  if (args.profile?.founded_date) {
+    availableKeys.add("founded_date");
+  }
+  if (args.profile?.logo_url) {
+    availableKeys.add("logo_url");
+  }
+  if (args.profile?.social_links?.linkedin) {
+    availableKeys.add("linkedin_url");
+  }
+  if (args.profile?.social_links?.youtube) {
+    availableKeys.add("youtube_url");
   }
 
   return {

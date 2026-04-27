@@ -100,9 +100,9 @@ export type AccountAuthMode =
   | "magic_link"
   | "google_oauth";
 
-export type FlowFamily = "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog";
+export type FlowFamily = "saas_directory" | "forum_profile" | "forum_post" | "wp_comment" | "dev_blog";
 
-export type FlowFamilySource = "explicit" | "defaulted" | "carried_forward" | "corrected";
+export type FlowFamilySource = "explicit" | "defaulted" | "inferred" | "carried_forward" | "corrected";
 
 export type TaskLane = "directory_active" | "non_directory_active" | "follow_up";
 

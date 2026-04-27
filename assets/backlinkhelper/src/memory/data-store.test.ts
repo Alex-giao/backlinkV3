@@ -70,3 +70,36 @@ test("legacy BACKLINER_DATA_ROOT remains the highest-priority override", async (
     else process.env.BACKLINKHELPER_STATE_DIR = previousStateDir;
   }
 });
+
+test("file datastore target-site facade round-trips imported candidate rows", async () => {
+  const previousDataRoot = process.env.BACKLINER_DATA_ROOT;
+  const previousStateDir = process.env.BACKLINKHELPER_STATE_DIR;
+  const previousStore = process.env.BACKLINKHELPER_STORE;
+  const tempRoot = path.join(os.tmpdir(), `bh-target-sites-${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  try {
+    delete process.env.BACKLINER_DATA_ROOT;
+    process.env.BACKLINKHELPER_STATE_DIR = tempRoot;
+    process.env.BACKLINKHELPER_STORE = "file";
+
+    const store = await importFreshDataStore();
+    await store.upsertTargetSite({
+      target_url: "https://example.com/post/1",
+      hostname: "example.com",
+      source: "unit-test",
+      submit_status: "candidate",
+      imported_at: "2026-04-24T00:00:00.000Z",
+      payload: { row: 1 },
+    });
+
+    const sites = await store.listTargetSites(10);
+    assert.equal(sites.length, 1);
+    assert.equal(sites[0].target_url, "https://example.com/post/1");
+  } finally {
+    if (previousDataRoot === undefined) delete process.env.BACKLINER_DATA_ROOT;
+    else process.env.BACKLINER_DATA_ROOT = previousDataRoot;
+    if (previousStateDir === undefined) delete process.env.BACKLINKHELPER_STATE_DIR;
+    else process.env.BACKLINKHELPER_STATE_DIR = previousStateDir;
+    if (previousStore === undefined) delete process.env.BACKLINKHELPER_STORE;
+    else process.env.BACKLINKHELPER_STORE = previousStore;
+  }
+});

@@ -2227,7 +2227,7 @@ export async function runTakeoverFinalization(args: {
         let screenshotAvailable = false;
         let captchaSolverAttempt: CapsolverAttemptRecord | undefined;
         try {
-          await page.screenshot({ path: screenshotPath, fullPage: true });
+          await page.screenshot({ path: screenshotPath, fullPage: false });
           screenshotAvailable = true;
         } catch {
           screenshotAvailable = false;
@@ -2299,7 +2299,7 @@ export async function runTakeoverFinalization(args: {
           title = pageState.title;
           bodyText = mergeFinalizationVisibleText(pageState.bodyText, pageState.visibleSurfaceText);
           try {
-            await page.screenshot({ path: screenshotPath, fullPage: true });
+            await page.screenshot({ path: screenshotPath, fullPage: false });
             screenshotAvailable = true;
           } catch {
             screenshotAvailable = false;

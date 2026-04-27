@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["anchor_text", "comment_html", "reason"],
+  "properties": {
+    "anchor_text": {
+      "type": "string",
+      "minLength": 2,
+      "maxLength": 80
+    },
+    "comment_html": {
+      "type": "string",
+      "minLength": 60,
+      "maxLength": 700
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 5,
+      "maxLength": 300
+    }
+  }
+}

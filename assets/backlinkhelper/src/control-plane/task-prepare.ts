@@ -1,7 +1,9 @@
 import { acquireBrowserOwnership, releaseBrowserOwnership } from "../execution/ownership-lock.js";
 import { runTrajectoryReplay } from "../execution/replay.js";
+import { resolveCapsolverConfig } from "../execution/capsolver.js";
 import { runLightweightScout } from "../execution/scout.js";
 import { classifyEarlyTerminalOutcome } from "../execution/takeover.js";
+import { applyTargetFlowFamilyClassificationToTask } from "../families/classifier.js";
 import { getAccountForHostname } from "../memory/account-registry.js";
 import { getCredential } from "../memory/credential-vault.js";
 import {
@@ -34,6 +36,13 @@ import type {
 function updateTaskStatus(task: TaskRecord, status: TaskStatus): void {
   task.status = status;
   task.updated_at = new Date().toISOString();
+}
+
+export function reclassifyTaskFlowFamilyForPrepare(
+  task: TaskRecord,
+  reasonPrefix = "task-prepare target classification",
+): boolean {
+  return applyTargetFlowFamilyClassificationToTask({ task, reasonPrefix });
 }
 
 function inferRegistrationRequired(task: TaskRecord, scoutTextHints: string[]): boolean {
@@ -220,6 +229,39 @@ export function inferOpportunityClassFromScout(
   return "recovery_ambiguous";
 }
 
+function hasUrlParam(value: string | undefined, param: string): boolean {
+  if (!value) {
+    return false;
+  }
+  try {
+    return Boolean(new URL(value).searchParams.get(param));
+  } catch {
+    return new RegExp(`[?&]${param}=[^&]+`).test(value);
+  }
+}
+
+function scoutHasSolverSupportedCaptcha(scout: ScoutResult): boolean {
+  if (!resolveCapsolverConfig().enabled) {
+    return false;
+  }
+
+  return (scout.embed_hints ?? []).some((hint) => {
+    const provider = hint.provider.toLowerCase();
+    const frameUrl = hint.frame_url ?? "";
+    const frameUrlLower = frameUrl.toLowerCase();
+
+    if ((provider.includes("recaptcha") || frameUrlLower.includes("recaptcha")) && hasUrlParam(frameUrl, "k")) {
+      return true;
+    }
+
+    if ((provider.includes("turnstile") || frameUrlLower.includes("turnstile")) && hasUrlParam(frameUrl, "sitekey")) {
+      return true;
+    }
+
+    return false;
+  });
+}
+
 function buildScoutTerminalBoundaryText(scout: ScoutResult): string {
   const embedText = (scout.embed_hints ?? [])
     .map((hint) =>
@@ -244,7 +286,11 @@ function buildScoutTerminalBoundaryText(scout: ScoutResult): string {
     ...(scout.submit_candidates ?? []),
     ...(scout.field_hints ?? []),
     ...(scout.auth_hints ?? []),
-    ...(scout.anti_bot_hints ?? []),
+    // Standalone anti_bot_hints are scanner labels (often triggered by hidden
+    // newsletter honeypots like captcha2_h / spam text) rather than visible,
+    // actionable CAPTCHA evidence. Real terminal evidence should come from the
+    // page snapshot / embed excerpts so wp_comment tasks can still reach the
+    // operator/finalizer where CapSolver gets a chance to run.
     embedText,
   ]
     .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
@@ -273,6 +319,10 @@ export function classifyScoutTerminalBoundary(args: {
     "WAITING_MANUAL_AUTH",
     "WAITING_MISSING_INPUT",
   ]);
+
+  if (classification.outcome.wait?.wait_reason_code === "CAPTCHA_BLOCKED" && scoutHasSolverSupportedCaptcha(args.scout)) {
+    return undefined;
+  }
 
   if (classification.evidence_sufficiency !== "sufficient") {
     return undefined;
@@ -458,6 +508,7 @@ export async function prepareTaskForAgent(args: {
   }
 
   markTaskStageTimestamp(task, "prepare_started_at");
+  reclassifyTaskFlowFamilyForPrepare(task, "task-prepare initial target");
 
   const runtime = await runPreflight(await resolveBrowserRuntime(args.cdpUrl), { mode: "light" });
   const preflightPath = getLatestPreflightPath();
@@ -580,6 +631,7 @@ export async function prepareTaskForAgent(args: {
       task.recovered_target_url = recoveredTargetUrl;
       task.target_url = recoveredTargetUrl;
       task.hostname = new URL(recoveredTargetUrl).hostname;
+      reclassifyTaskFlowFamilyForPrepare(task, "task-prepare recovered target");
       task.notes.push(`Auto-rescanned stale submit path and switched target URL to ${recoveredTargetUrl}.`);
       scout = await runLightweightScout({ runtime, task });
       await writeJsonFile(scoutArtifactPath, scout);
@@ -620,6 +672,7 @@ export async function prepareTaskForAgent(args: {
     if (scout.page_snapshot.url && scout.page_snapshot.url !== task.target_url) {
       task.target_url = scout.page_snapshot.url;
       task.hostname = new URL(scout.page_snapshot.url).hostname;
+      reclassifyTaskFlowFamilyForPrepare(task, "task-prepare canonical target");
       task.notes.push(`Canonicalized target URL to ${scout.page_snapshot.url} based on scout.`);
     }
 

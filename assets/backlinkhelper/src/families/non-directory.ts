@@ -92,6 +92,52 @@ export const FORUM_PROFILE_FAMILY: FamilyConfig = {
   },
 };
 
+export const FORUM_POST_FAMILY: FamilyConfig = {
+  flowFamily: "forum_post",
+  scout: {
+    fieldHints: ["reply", "post reply", "thread", "topic", "message", "signature", "website", "bbcode", "quote"],
+    authHints: SHARED_AUTH_HINTS,
+    antiBotHints: [...SHARED_ANTI_BOT_HINTS, "anti spam", "flood control", "moderation"],
+    evidenceSignals: ["post reply", "reply to thread", "new reply", "your post", "awaiting moderation", "moderator approval", "thread"],
+  },
+  pageAssessment: {
+    submitSignals: ["post reply", "reply to thread", "add reply", "new reply", "submit reply", "quote", "reply"],
+    loginSignals: ["password", "sign in", "log in", "login", "passkey", "verify it's you", "verify its you", "2fa", "two-factor"],
+    registerSignals: ["sign up", "create account", "register", "join now", "join forum"],
+    dashboardSignals: ["forum", "thread", "topic", "profile", "user control panel", "logout", "sign out"],
+    overlaySignals: SHARED_OVERLAY_SIGNALS,
+  },
+  completeness: {
+    core_ready_fields: ["company_name", "contact_email", "primary_category"],
+    flow_ready_fields: [],
+    conditional_ready_fields: [],
+  },
+  taskProgress: {
+    submitSignals: ["post reply", "reply to thread", "add reply", "new reply", "submit reply", "quote", "reply"],
+    formSignals: ["message", "reply", "bbcode", "signature", "website", "subject", "thread", "topic"],
+    authSignals: SHARED_AUTH_HINTS,
+    confirmationSignals: ["post submitted", "reply posted", "your post has been posted", "awaiting moderation", "moderator approval", "post is awaiting approval"],
+    captchaSignals: ["captcha", "verify you are human", "cloudflare", "anti spam", "flood control"],
+  },
+  reasonInference: {
+    terminalSuccessSignals: [],
+    ...SHARED_REASON_INFERENCE,
+  },
+  takeover: {
+    successSignals: ["post submitted", "reply posted", "your post has been posted", "awaiting moderation", "moderator approval", "post is awaiting approval"],
+    emailVerificationSignals: SHARED_REASON_INFERENCE.externalEventSignals,
+    pendingSignals: ["awaiting moderation", "moderator approval", "post is awaiting approval", "reply submitted"],
+    publishedSignals: ["reply posted", "your post has been posted", "post published"],
+    antiSpamSignals: ["anti spam", "anti-spam", "flood control", "spam detected", "blocked by moderator"],
+  },
+  semanticContract: {
+    requires_live_link_verification_for_success: true,
+    pending_wait_reason_codes: ["FORUM_POST_MODERATION_PENDING", "FORUM_POST_PUBLICATION_PENDING"],
+    review_wait_reason_codes: ["FORUM_POST_PUBLISHED_NO_LINK"],
+    policy_wait_reason_codes: ["FORUM_POST_ANTI_SPAM_BLOCKED"],
+  },
+};
+
 export const WP_COMMENT_FAMILY: FamilyConfig = {
   flowFamily: "wp_comment",
   scout: {

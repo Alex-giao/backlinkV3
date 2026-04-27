@@ -1526,7 +1526,7 @@ export async function runTakeoverFinalization(args) {
             let screenshotAvailable = false;
             let captchaSolverAttempt;
             try {
-                await page.screenshot({ path: screenshotPath, fullPage: true });
+                await page.screenshot({ path: screenshotPath, fullPage: false });
                 screenshotAvailable = true;
             }
             catch {
@@ -1592,7 +1592,7 @@ export async function runTakeoverFinalization(args) {
                 title = pageState.title;
                 bodyText = mergeFinalizationVisibleText(pageState.bodyText, pageState.visibleSurfaceText);
                 try {
-                    await page.screenshot({ path: screenshotPath, fullPage: true });
+                    await page.screenshot({ path: screenshotPath, fullPage: false });
                     screenshotAvailable = true;
                 }
                 catch {

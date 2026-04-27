@@ -19,6 +19,8 @@ export function describeFlowFamily(flowFamily?: FlowFamily): string {
   switch (resolveFlowFamily(flowFamily)) {
     case "forum_profile":
       return "forum profile";
+    case "forum_post":
+      return "forum thread reply/post";
     case "wp_comment":
       return "WordPress comment";
     case "dev_blog":

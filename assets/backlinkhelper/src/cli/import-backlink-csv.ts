@@ -1,0 +1,198 @@
+import { readFile } from "node:fs/promises";
+
+import { enqueueSiteTask } from "../control-plane/task-queue.js";
+import { classifyTargetFlowFamily } from "../families/classifier.js";
+import { ensureDataDirectories, hostnameToKey, upsertTargetSite } from "../memory/data-store.js";
+import type { FlowFamily } from "../shared/types.js";
+
+function parseCsvLine(line: string): string[] {
+  const values: string[] = [];
+  let current = "";
+  let quoted = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    const next = line[index + 1];
+    if (char === '"' && quoted && next === '"') {
+      current += '"';
+      index += 1;
+      continue;
+    }
+    if (char === '"') {
+      quoted = !quoted;
+      continue;
+    }
+    if (char === "," && !quoted) {
+      values.push(current);
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+  values.push(current);
+  return values.map((value) => value.trim());
+}
+
+function readCsvRows(content: string): Record<string, string>[] {
+  const lines = content.replace(/^\uFEFF/, "").split(/\r?\n/).filter((line) => line.trim());
+  if (lines.length === 0) {
+    return [];
+  }
+  const headers = parseCsvLine(lines[0]);
+  return lines.slice(1).map((line) => {
+    const values = parseCsvLine(line);
+    return Object.fromEntries(headers.map((header, index) => [header, values[index] ?? ""]));
+  });
+}
+
+function normalizeUrl(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return undefined;
+    }
+    url.hash = "";
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+function buildTaskId(args: { prefix: string; index: number; targetUrl: string }): string {
+  const hostname = hostnameToKey(new URL(args.targetUrl).hostname).replace(/\./g, "-");
+  return `${args.prefix}-${String(args.index).padStart(4, "0")}-${hostname}`.slice(0, 120);
+}
+
+export function classifyImportedTargetFlowFamily(args: {
+  targetUrl: string;
+  requestedFlowFamily?: FlowFamily;
+}) {
+  return classifyTargetFlowFamily({
+    targetUrl: args.targetUrl,
+    requestedFlowFamily: args.requestedFlowFamily,
+  });
+}
+
+export async function runImportBacklinkCsvCommand(args: {
+  csvPath: string;
+  urlColumn?: string;
+  source?: string;
+  limit?: number;
+  offset?: number;
+  flowFamily?: FlowFamily;
+  enqueue?: boolean;
+  promotedUrl?: string;
+  promotedName?: string;
+  promotedDescription?: string;
+  taskIdPrefix?: string;
+  submitterEmailBase?: string;
+}): Promise<void> {
+  await ensureDataDirectories();
+  const csv = await readFile(args.csvPath, "utf8");
+  const rows = readCsvRows(csv);
+  const urlColumn = args.urlColumn ?? "source_url";
+  const offset = args.offset ?? 0;
+  const limit = args.limit ?? rows.length;
+  const selected = rows.slice(offset, offset + limit);
+  const seenUrls = new Set<string>();
+  let imported = 0;
+  let enqueued = 0;
+  let skipped = 0;
+  let failed = 0;
+  const taskIds: string[] = [];
+
+  if (args.enqueue && !args.promotedUrl) {
+    throw new Error("--enqueue requires --promoted-url.");
+  }
+
+  for (const [index, row] of selected.entries()) {
+    const targetUrl = normalizeUrl(row[urlColumn] ?? "");
+    if (!targetUrl || seenUrls.has(targetUrl)) {
+      skipped += 1;
+      continue;
+    }
+    seenUrls.add(targetUrl);
+    const hostname = new URL(targetUrl).hostname;
+    const flowFamilyClassification = classifyImportedTargetFlowFamily({
+      targetUrl,
+      requestedFlowFamily: args.flowFamily,
+    });
+    const taskId = args.enqueue && args.promotedUrl
+      ? buildTaskId({ prefix: args.taskIdPrefix ?? "csv-import", index: offset + index + 1, targetUrl })
+      : undefined;
+
+    let lastTaskId = taskId;
+    let submitStatus: "candidate" | "enqueued" | "failed" | "skipped" = taskId ? "enqueued" : "candidate";
+    let enqueueOutcome: string | undefined;
+    let enqueueError: string | undefined;
+
+    if (taskId && args.promotedUrl) {
+      try {
+        const result = await enqueueSiteTask({
+          taskId,
+          targetUrl,
+          promotedUrl: args.promotedUrl,
+          promotedName: args.promotedName,
+          promotedDescription: args.promotedDescription,
+          submitterEmailBase: args.submitterEmailBase,
+          confirmSubmit: false,
+          flowFamily: args.flowFamily,
+          enqueuedBy: "import-backlink-csv",
+        });
+        enqueueOutcome = result.outcome;
+        lastTaskId = result.task.id;
+        taskIds.push(result.task.id);
+        if (
+          result.outcome === "accept_new_task" ||
+          result.outcome === "reactivated_existing_task" ||
+          result.outcome === "reused_existing_task"
+        ) {
+          enqueued += 1;
+          submitStatus = "enqueued";
+        } else {
+          skipped += 1;
+          submitStatus = "skipped";
+        }
+      } catch (error) {
+        failed += 1;
+        submitStatus = "failed";
+        enqueueError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    await upsertTargetSite({
+      target_url: targetUrl,
+      hostname,
+      source: args.source ?? "csv-import",
+      flow_family_hint: flowFamilyClassification.flowFamily,
+      submit_status: submitStatus,
+      imported_at: new Date().toISOString(),
+      last_task_id: lastTaskId,
+      payload: {
+        row_index: offset + index + 1,
+        row,
+        enqueue_outcome: enqueueOutcome,
+        enqueue_error: enqueueError,
+        requested_flow_family: args.flowFamily,
+        flow_family_source: flowFamilyClassification.source,
+        flow_family_reason: flowFamilyClassification.reason,
+        corrected_from_family: flowFamilyClassification.correctedFromFamily,
+      },
+    });
+    imported += 1;
+  }
+
+  console.log(JSON.stringify({
+    csv_path: args.csvPath,
+    url_column: urlColumn,
+    rows_seen: selected.length,
+    imported,
+    enqueued,
+    skipped,
+    failed,
+    task_ids_sample: taskIds.slice(0, 10),
+  }, null, 2));
+}

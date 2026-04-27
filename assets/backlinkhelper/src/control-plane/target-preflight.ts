@@ -21,6 +21,7 @@ const GENERIC_AUTH_PATTERN = /\b(login|sign[-_ ]?in|account|dashboard|admin)\b/i
 const DIRECTORY_SUBMIT_PATTERN = /\b(submit|add[-_ ]?listing|list[-_ ]?your|directory|startup|tool|product|community)\b/i;
 const FORUM_PROFILE_PATTERN = /\b(profile|user|member|members|join|signup|sign[-_ ]?up|register|settings)\b/i;
 const WP_COMMENT_PATTERN = /\b(article|post|blog|news|story|discussion|comment)\b/i;
+const FORUM_THREAD_SURFACE_PATTERN = /(?:^|[./?&=_-])(?:forum|forums|viewtopic|showthread|thread|threads|topic)(?:$|[./?&=_-])/i;
 const DEV_BLOG_PATTERN = /\b(new|write|editor|create|post|publish|submit|story)\b/i;
 const CONTENT_PATH_PATTERN = /\b(blog|docs|article|post|story|news|guide|tutorial|comment)\b/i;
 
@@ -95,7 +96,14 @@ function scoreFamilyPath(args: {
       break;
     }
     case "wp_comment": {
-      if (WP_COMMENT_PATTERN.test(evidenceText) || pathDepth >= 2) {
+      if (FORUM_THREAD_SURFACE_PATTERN.test(evidenceText)) {
+        addSignal(
+          signals,
+          "family_path_signal",
+          "Forum/thread URL should not be treated as a wp_comment surface; route through forum-specific handling instead.",
+          -45,
+        );
+      } else if (WP_COMMENT_PATTERN.test(evidenceText) || pathDepth >= 2) {
         addSignal(signals, "family_path_signal", "Article-like path depth looks compatible with comment-style submission surfaces.", 14);
       } else {
         addSignal(signals, "family_path_signal", "Homepage-like target is less informative for comment workflows and should be deprioritized.", -8);

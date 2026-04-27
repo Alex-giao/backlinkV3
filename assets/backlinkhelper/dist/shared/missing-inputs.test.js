@@ -201,6 +201,84 @@ test("summarizeMissingInputPreflight reports completeness tiers based on resolve
     assert.equal(report.completeness.flow_ready, false);
     assert.deepEqual(report.completeness.missing_flow_fields, ["address_line_1", "city", "postal_code", "submitter_first_name", "submitter_last_name"]);
 });
+test("summarizeMissingInputPreflight counts autofillable dossier defaults for completeness even before any task is waiting", () => {
+    const report = summarizeMissingInputPreflight({
+        tasks: [],
+        profile: makeProfile({
+            dossier_fields: {
+                phone_number: {
+                    key: "phone_number",
+                    label: "Phone Number",
+                    value: "+1-907-766-9537",
+                    source_type: "user_confirmed",
+                    confidence: "high",
+                    verified_at: "2026-04-25T00:00:00.000Z",
+                    updated_at: "2026-04-25T00:00:00.000Z",
+                    reuse_scope: "promoted_site",
+                    allowed_for_autofill: true,
+                },
+                address_line_1: {
+                    key: "address_line_1",
+                    label: "Address Line 1",
+                    value: "4897 Kenton Ports Apt. 595",
+                    source_type: "user_confirmed",
+                    confidence: "high",
+                    verified_at: "2026-04-25T00:00:00.000Z",
+                    updated_at: "2026-04-25T00:00:00.000Z",
+                    reuse_scope: "promoted_site",
+                    allowed_for_autofill: true,
+                },
+                city: {
+                    key: "city",
+                    label: "City",
+                    value: "Los Angeles",
+                    source_type: "user_confirmed",
+                    confidence: "high",
+                    verified_at: "2026-04-25T00:00:00.000Z",
+                    updated_at: "2026-04-25T00:00:00.000Z",
+                    reuse_scope: "promoted_site",
+                    allowed_for_autofill: true,
+                },
+                postal_code: {
+                    key: "postal_code",
+                    label: "Postal Code",
+                    value: "90057",
+                    source_type: "user_confirmed",
+                    confidence: "high",
+                    verified_at: "2026-04-25T00:00:00.000Z",
+                    updated_at: "2026-04-25T00:00:00.000Z",
+                    reuse_scope: "promoted_site",
+                    allowed_for_autofill: true,
+                },
+                submitter_first_name: {
+                    key: "submitter_first_name",
+                    label: "Submitter First Name",
+                    value: "Boll",
+                    source_type: "user_confirmed",
+                    confidence: "high",
+                    verified_at: "2026-04-25T00:00:00.000Z",
+                    updated_at: "2026-04-25T00:00:00.000Z",
+                    reuse_scope: "promoted_site",
+                    allowed_for_autofill: true,
+                },
+                submitter_last_name: {
+                    key: "submitter_last_name",
+                    label: "Submitter Last Name",
+                    value: "Barer",
+                    source_type: "user_confirmed",
+                    confidence: "high",
+                    verified_at: "2026-04-25T00:00:00.000Z",
+                    updated_at: "2026-04-25T00:00:00.000Z",
+                    reuse_scope: "promoted_site",
+                    allowed_for_autofill: true,
+                },
+            },
+        }),
+    });
+    assert.equal(report.completeness.core_ready, true);
+    assert.equal(report.completeness.flow_ready, true);
+    assert.deepEqual(report.completeness.missing_flow_fields, []);
+});
 test("summarizeMissingInputPreflight uses family-specific completeness instead of directory defaults", () => {
     const report = summarizeMissingInputPreflight({
         tasks: [

@@ -10,6 +10,8 @@ import type {
   WorkerLease,
   WorkerLeaseGroup,
 } from "../shared/types.js";
+import { createWranglerD1DataStore } from "./wrangler-d1-data-store.js";
+import type { DataStoreBackend, TargetSiteRecord } from "./sql-data-store.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -51,7 +53,9 @@ export const DATA_DIRECTORIES = {
   vault: path.join(DATA_ROOT, "vault"),
 } as const;
 
-export async function ensureDataDirectories(): Promise<void> {
+export type BacklinkHelperStoreKind = "file" | "d1";
+
+async function ensureFileDataDirectories(): Promise<void> {
   await Promise.all(
     Object.values(DATA_DIRECTORIES).map((directoryPath) =>
       mkdir(directoryPath, { recursive: true }),
@@ -139,70 +143,200 @@ export function getCredentialFilePath(credentialRef: string): string {
   return path.join(DATA_DIRECTORIES.vault, `${hostnameToKey(credentialRef)}.json`);
 }
 
+export class FileDataStore implements DataStoreBackend {
+  readonly kind = "file" as const;
+
+  async ensureDataDirectories(): Promise<void> {
+    await ensureFileDataDirectories();
+  }
+
+  async loadTask(taskId: string): Promise<TaskRecord | undefined> {
+    return readJsonFile<TaskRecord>(getTaskFilePath(taskId));
+  }
+
+  async saveTask(task: TaskRecord): Promise<void> {
+    await writeJsonFile(getTaskFilePath(task.id), task);
+  }
+
+  async listTasks(): Promise<TaskRecord[]> {
+    await mkdir(DATA_DIRECTORIES.tasks, { recursive: true });
+    const entries = await readdir(DATA_DIRECTORIES.tasks, { withFileTypes: true });
+    const tasks = await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .map((entry) => readJsonFile<TaskRecord>(path.join(DATA_DIRECTORIES.tasks, entry.name))),
+    );
+
+    return tasks.filter((task): task is TaskRecord => Boolean(task));
+  }
+
+  async loadWorkerLease(group: WorkerLeaseGroup = "active"): Promise<WorkerLease | undefined> {
+    return readJsonFile<WorkerLease>(getWorkerLeasePath(group));
+  }
+
+  async loadAllWorkerLeases(): Promise<Record<WorkerLeaseGroup, WorkerLease | undefined>> {
+    const leases = await Promise.all(WORKER_LEASE_GROUPS.map(async (group) => [group, await this.loadWorkerLease(group)] as const));
+    return Object.fromEntries(leases) as Record<WorkerLeaseGroup, WorkerLease | undefined>;
+  }
+
+  async saveWorkerLease(
+    lease: WorkerLease,
+    group: WorkerLeaseGroup = lease.group ?? "active",
+  ): Promise<void> {
+    await writeJsonFile(getWorkerLeasePath(group), {
+      ...lease,
+      group,
+    } satisfies WorkerLease);
+  }
+
+  async clearWorkerLease(group: WorkerLeaseGroup = "active"): Promise<void> {
+    const leasePath = getWorkerLeasePath(group);
+    try {
+      await unlink(leasePath);
+    } catch (error) {
+      const typedError = error as NodeJS.ErrnoException;
+      if (typedError.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+
+  async clearWorkerLeaseForTask(taskId: string): Promise<boolean> {
+    let cleared = false;
+    for (const group of WORKER_LEASE_GROUPS) {
+      const existingLease = await this.loadWorkerLease(group);
+      if (!existingLease || existingLease.task_id !== taskId) {
+        continue;
+      }
+
+      await this.clearWorkerLease(group);
+      cleared = true;
+    }
+
+    return cleared;
+  }
+
+  async loadAccountRecord(hostname: string): Promise<AccountRecord | undefined> {
+    return readJsonFile<AccountRecord>(getAccountFilePath(hostname));
+  }
+
+  async saveAccountRecord(account: AccountRecord): Promise<void> {
+    await writeJsonFile(getAccountFilePath(account.hostname), account);
+  }
+
+  async loadCredentialRecord(
+    credentialRef: string,
+  ): Promise<CredentialVaultRecord | undefined> {
+    return readJsonFile<CredentialVaultRecord>(getCredentialFilePath(credentialRef));
+  }
+
+  async saveCredentialRecord(record: CredentialVaultRecord): Promise<void> {
+    await writeJsonFile(getCredentialFilePath(record.credential_ref), record);
+  }
+
+  async deleteCredentialRecord(credentialRef: string): Promise<void> {
+    try {
+      await rm(getCredentialFilePath(credentialRef), { force: true });
+    } catch (error) {
+      const typedError = error as NodeJS.ErrnoException;
+      if (typedError.code !== "ENOENT") {
+        throw error;
+      }
+    }
+  }
+
+  async upsertTargetSite(target: TargetSiteRecord): Promise<void> {
+    await writeJsonFile(path.join(DATA_DIRECTORIES.runtime, "target-sites", `${hostnameToKey(target.hostname)}.json`), target);
+  }
+
+  async listTargetSites(limit = 100): Promise<TargetSiteRecord[]> {
+    const targetSiteDirectory = path.join(DATA_DIRECTORIES.runtime, "target-sites");
+    await mkdir(targetSiteDirectory, { recursive: true });
+    const entries = await readdir(targetSiteDirectory, { withFileTypes: true });
+    const sites = await Promise.all(
+      entries
+        .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
+        .sort((left, right) => left.name.localeCompare(right.name))
+        .slice(0, limit)
+        .map((entry) => readJsonFile<TargetSiteRecord>(path.join(targetSiteDirectory, entry.name))),
+    );
+    return sites.filter((site): site is TargetSiteRecord => Boolean(site));
+  }
+}
+
+export function getConfiguredStoreKind(): BacklinkHelperStoreKind {
+  const rawValue = process.env.BACKLINKHELPER_STORE?.trim().toLowerCase();
+  if (!rawValue || rawValue === "file") {
+    return "file";
+  }
+  if (rawValue === "d1" || rawValue === "cloudflare-d1") {
+    return "d1";
+  }
+  throw new Error(`Unsupported BACKLINKHELPER_STORE value: ${process.env.BACKLINKHELPER_STORE}`);
+}
+
+export function createConfiguredDataStore(): DataStoreBackend {
+  const kind = getConfiguredStoreKind();
+  if (kind === "file") {
+    return new FileDataStore();
+  }
+
+  const databaseName = process.env.BACKLINKHELPER_D1_DATABASE_NAME?.trim();
+  if (!databaseName) {
+    throw new Error("BACKLINKHELPER_STORE=d1 requires BACKLINKHELPER_D1_DATABASE_NAME.");
+  }
+  const remote = process.env.BACKLINKHELPER_D1_LOCAL === "1" ? false : true;
+  return createWranglerD1DataStore({ databaseName, remote, cwd: REPO_ROOT });
+}
+
+let activeDataStore: DataStoreBackend | undefined;
+
+export function getActiveDataStore(): DataStoreBackend {
+  activeDataStore ??= createConfiguredDataStore();
+  return activeDataStore;
+}
+
+export function __setActiveDataStoreForTest(store: DataStoreBackend | undefined): void {
+  activeDataStore = store;
+}
+
+export async function ensureDataDirectories(): Promise<void> {
+  await getActiveDataStore().ensureDataDirectories();
+}
+
 export async function loadTask(taskId: string): Promise<TaskRecord | undefined> {
-  return readJsonFile<TaskRecord>(getTaskFilePath(taskId));
+  return getActiveDataStore().loadTask(taskId);
 }
 
 export async function saveTask(task: TaskRecord): Promise<void> {
-  await writeJsonFile(getTaskFilePath(task.id), task);
+  await getActiveDataStore().saveTask(task);
 }
 
 export async function listTasks(): Promise<TaskRecord[]> {
-  await mkdir(DATA_DIRECTORIES.tasks, { recursive: true });
-  const entries = await readdir(DATA_DIRECTORIES.tasks, { withFileTypes: true });
-  const tasks = await Promise.all(
-    entries
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".json"))
-      .map((entry) => readJsonFile<TaskRecord>(path.join(DATA_DIRECTORIES.tasks, entry.name))),
-  );
-
-  return tasks.filter((task): task is TaskRecord => Boolean(task));
+  return getActiveDataStore().listTasks();
 }
 
 export async function loadWorkerLease(group: WorkerLeaseGroup = "active"): Promise<WorkerLease | undefined> {
-  return readJsonFile<WorkerLease>(getWorkerLeasePath(group));
+  return getActiveDataStore().loadWorkerLease(group);
 }
 
 export async function loadAllWorkerLeases(): Promise<Record<WorkerLeaseGroup, WorkerLease | undefined>> {
-  const leases = await Promise.all(WORKER_LEASE_GROUPS.map(async (group) => [group, await loadWorkerLease(group)] as const));
-  return Object.fromEntries(leases) as Record<WorkerLeaseGroup, WorkerLease | undefined>;
+  return getActiveDataStore().loadAllWorkerLeases();
 }
 
 export async function saveWorkerLease(
   lease: WorkerLease,
   group: WorkerLeaseGroup = lease.group ?? "active",
 ): Promise<void> {
-  await writeJsonFile(getWorkerLeasePath(group), {
-    ...lease,
-    group,
-  } satisfies WorkerLease);
+  await getActiveDataStore().saveWorkerLease(lease, group);
 }
 
 export async function clearWorkerLease(group: WorkerLeaseGroup = "active"): Promise<void> {
-  const leasePath = getWorkerLeasePath(group);
-  try {
-    await unlink(leasePath);
-  } catch (error) {
-    const typedError = error as NodeJS.ErrnoException;
-    if (typedError.code !== "ENOENT") {
-      throw error;
-    }
-  }
+  await getActiveDataStore().clearWorkerLease(group);
 }
 
 export async function clearWorkerLeaseForTask(taskId: string): Promise<boolean> {
-  let cleared = false;
-  for (const group of WORKER_LEASE_GROUPS) {
-    const existingLease = await loadWorkerLease(group);
-    if (!existingLease || existingLease.task_id !== taskId) {
-      continue;
-    }
-
-    await clearWorkerLease(group);
-    cleared = true;
-  }
-
-  return cleared;
+  return getActiveDataStore().clearWorkerLeaseForTask(taskId);
 }
 
 export async function clearPendingFinalize(taskId: string): Promise<void> {
@@ -217,30 +351,33 @@ export async function clearPendingFinalize(taskId: string): Promise<void> {
 }
 
 export async function loadAccountRecord(hostname: string): Promise<AccountRecord | undefined> {
-  return readJsonFile<AccountRecord>(getAccountFilePath(hostname));
+  return getActiveDataStore().loadAccountRecord(hostname);
 }
 
 export async function saveAccountRecord(account: AccountRecord): Promise<void> {
-  await writeJsonFile(getAccountFilePath(account.hostname), account);
+  await getActiveDataStore().saveAccountRecord(account);
 }
 
 export async function loadCredentialRecord(
   credentialRef: string,
 ): Promise<CredentialVaultRecord | undefined> {
-  return readJsonFile<CredentialVaultRecord>(getCredentialFilePath(credentialRef));
+  return getActiveDataStore().loadCredentialRecord(credentialRef);
 }
 
 export async function saveCredentialRecord(record: CredentialVaultRecord): Promise<void> {
-  await writeJsonFile(getCredentialFilePath(record.credential_ref), record);
+  await getActiveDataStore().saveCredentialRecord(record);
 }
 
 export async function deleteCredentialRecord(credentialRef: string): Promise<void> {
-  try {
-    await rm(getCredentialFilePath(credentialRef), { force: true });
-  } catch (error) {
-    const typedError = error as NodeJS.ErrnoException;
-    if (typedError.code !== "ENOENT") {
-      throw error;
-    }
-  }
+  await getActiveDataStore().deleteCredentialRecord(credentialRef);
 }
+
+export async function upsertTargetSite(target: TargetSiteRecord): Promise<void> {
+  await getActiveDataStore().upsertTargetSite(target);
+}
+
+export async function listTargetSites(limit?: number): Promise<TargetSiteRecord[]> {
+  return getActiveDataStore().listTargetSites(limit);
+}
+
+export type { DataStoreBackend, TargetSiteRecord } from "./sql-data-store.js";

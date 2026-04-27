@@ -3,6 +3,47 @@ import { listTasks, loadAllWorkerLeases, readJsonFile } from "../memory/data-sto
 import { buildTaskLaneReport, canRetry, matchesTaskScope, reapExpiredQueueState } from "../control-plane/task-queue.js";
 import { probeRuntimeHealth } from "../shared/runtime-health.js";
 import { buildBusinessOutcomeReport } from "../shared/business-outcomes.js";
+function roundMinutes(value) {
+    return Number(value.toFixed(2));
+}
+function buildLatestClaimTimingReport(tasks) {
+    const samples = tasks
+        .map((task) => {
+        const createdAt = new Date(task.created_at).getTime();
+        const updatedAt = new Date(task.updated_at).getTime();
+        const claimedAt = task.stage_timestamps?.claimed_at
+            ? new Date(task.stage_timestamps.claimed_at).getTime()
+            : Number.NaN;
+        if (![createdAt, updatedAt, claimedAt].every(Number.isFinite)) {
+            return undefined;
+        }
+        const totalMs = Math.max(0, updatedAt - createdAt);
+        const latestClaimExecutionMs = Math.max(0, updatedAt - claimedAt);
+        return {
+            totalMinutes: totalMs / 60_000,
+            latestClaimExecutionMinutes: latestClaimExecutionMs / 60_000,
+            queueOrCooldownMinutes: Math.max(0, totalMs - latestClaimExecutionMs) / 60_000,
+        };
+    })
+        .filter((sample) => Boolean(sample));
+    if (samples.length === 0) {
+        return {
+            samples: 0,
+            avg_total_minutes: 0,
+            avg_queue_or_cooldown_minutes: 0,
+            avg_latest_claim_execution_minutes: 0,
+            max_latest_claim_execution_minutes: 0,
+        };
+    }
+    const sum = (values) => values.reduce((total, value) => total + value, 0);
+    return {
+        samples: samples.length,
+        avg_total_minutes: roundMinutes(sum(samples.map((sample) => sample.totalMinutes)) / samples.length),
+        avg_queue_or_cooldown_minutes: roundMinutes(sum(samples.map((sample) => sample.queueOrCooldownMinutes)) / samples.length),
+        avg_latest_claim_execution_minutes: roundMinutes(sum(samples.map((sample) => sample.latestClaimExecutionMinutes)) / samples.length),
+        max_latest_claim_execution_minutes: roundMinutes(Math.max(...samples.map((sample) => sample.latestClaimExecutionMinutes))),
+    };
+}
 function buildSystemStatusReport(tasks) {
     const statusCounts = {};
     const waitReasonCounts = {};
@@ -41,6 +82,7 @@ function buildSystemStatusReport(tasks) {
         status_counts: statusCounts,
         wait_reason_top: waitReasonTop,
         repeat_failure_host_top: repeatFailureHostTop,
+        latest_claim_timing: buildLatestClaimTimingReport(tasks),
     };
 }
 function emptyFollowUpOutcomeReport() {

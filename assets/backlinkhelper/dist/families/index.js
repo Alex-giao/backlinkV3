@@ -1,8 +1,9 @@
-import { DEV_BLOG_FAMILY, FORUM_PROFILE_FAMILY, WP_COMMENT_FAMILY } from "./non-directory.js";
+import { DEV_BLOG_FAMILY, FORUM_POST_FAMILY, FORUM_PROFILE_FAMILY, WP_COMMENT_FAMILY } from "./non-directory.js";
 import { SAAS_DIRECTORY_FAMILY } from "./saas-directory.js";
 const FAMILY_CONFIGS = {
     saas_directory: SAAS_DIRECTORY_FAMILY,
     forum_profile: FORUM_PROFILE_FAMILY,
+    forum_post: FORUM_POST_FAMILY,
     wp_comment: WP_COMMENT_FAMILY,
     dev_blog: DEV_BLOG_FAMILY,
 };

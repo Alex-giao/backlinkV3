@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildHomepageProbeUrl, classifyScoutTerminalBoundary, inferOpportunityClassFromScout, mustRunHomepageRecoveryBeforeRetry, shouldProbeHomepageForSubmitRecovery, } from "./task-prepare.js";
+import { buildHomepageProbeUrl, classifyScoutTerminalBoundary, inferOpportunityClassFromScout, mustRunHomepageRecoveryBeforeRetry, reclassifyTaskFlowFamilyForPrepare, shouldProbeHomepageForSubmitRecovery, } from "./task-prepare.js";
 function makeTask(overrides = {}) {
     return {
         id: "task-prepare-test",
@@ -55,6 +55,36 @@ function makeScout(overrides = {}) {
         ...overrides,
     };
 }
+test("task-prepare reclassifies forum thread targets out of wp_comment before scout", () => {
+    const task = makeTask({
+        target_url: "https://cyberlord.at/forum/?id=1&thread=6857",
+        hostname: "cyberlord.at",
+        flow_family: "wp_comment",
+        flow_family_source: "explicit",
+        flow_family_reason: "Imported as wp_comment.",
+    });
+    const changed = reclassifyTaskFlowFamilyForPrepare(task, "unit-test prepare");
+    assert.equal(changed, true);
+    assert.equal(task.flow_family, "forum_post");
+    assert.equal(task.flow_family_source, "corrected");
+    assert.equal(task.corrected_from_family, "wp_comment");
+    assert.match(task.flow_family_reason ?? "", /unit-test prepare: Target URL has a strong forum\/thread surface signal/i);
+    assert.match(task.notes.at(-1) ?? "", /corrected flow family from wp_comment to forum_post/i);
+});
+test("task-prepare infers forum thread targets without synthetic corrected-from audit", () => {
+    const task = makeTask({
+        target_url: "https://community.example.com/threads/bank-statement-pdf-to-csv.42/",
+        hostname: "community.example.com",
+        flow_family: undefined,
+        flow_family_source: undefined,
+        flow_family_reason: undefined,
+    });
+    const changed = reclassifyTaskFlowFamilyForPrepare(task, "unit-test prepare");
+    assert.equal(changed, true);
+    assert.equal(task.flow_family, "forum_post");
+    assert.equal(task.flow_family_source, "inferred");
+    assert.equal(task.corrected_from_family, undefined);
+});
 test("buildHomepageProbeUrl normalizes stale submit URLs to homepage", () => {
     assert.equal(buildHomepageProbeUrl("https://example.com/submit/#"), "https://example.com/");
     assert.equal(buildHomepageProbeUrl("https://example.com/"), undefined);
@@ -246,6 +276,89 @@ test("scout terminal classifier front-loads existing-account login walls", () =>
     });
     assert.equal(classification?.outcome.next_status, "WAITING_MANUAL_AUTH");
     assert.equal(classification?.outcome.wait?.wait_reason_code, "DIRECTORY_LOGIN_REQUIRED");
+});
+test("scout terminal classifier lets solver-supported reCAPTCHA continue to operator", () => {
+    const previousKey = process.env.CAPSOLVER_API_KEY;
+    process.env.CAPSOLVER_API_KEY = "test-capsolver-key";
+    try {
+        const task = makeTask({ flow_family: "wp_comment" });
+        const scout = makeScout({
+            surface_summary: "Comment form is visible but protected by reCAPTCHA.",
+            submit_candidates: ["Publicar el comentario"],
+            field_hints: ["comment", "email"],
+            anti_bot_hints: ["captcha", "recaptcha"],
+            embed_hints: [
+                {
+                    frame_index: 1,
+                    provider: "recaptcha",
+                    frame_url: "https://www.google.com/recaptcha/api2/anchor?ar=1&k=6LeNUEEaAAAAAAmw20N_xTsaG5SKAAF18JV4IkX9&size=invisible",
+                    frame_title: "reCAPTCHA",
+                    body_text_excerpt: "protected by reCAPTCHA",
+                    cta_candidates: [],
+                    submit_candidates: [],
+                    likely_interactive: false,
+                },
+            ],
+            page_snapshot: {
+                url: "https://blog.example.com/post",
+                title: "Blog post",
+                response_status: 200,
+                body_text_excerpt: "Leave a reply. Publicar el comentario. protected by reCAPTCHA.",
+            },
+            page_assessment: {
+                page_reachable: true,
+                visual_verification_required: true,
+                classification_confidence: "medium",
+                ambiguity_flags: ["overlay_or_interstitial_present"],
+            },
+        });
+        const classification = classifyScoutTerminalBoundary({
+            task,
+            scout,
+            evidenceRef: "artifact.json",
+        });
+        assert.equal(classification, undefined);
+    }
+    finally {
+        if (previousKey === undefined) {
+            delete process.env.CAPSOLVER_API_KEY;
+        }
+        else {
+            process.env.CAPSOLVER_API_KEY = previousKey;
+        }
+    }
+});
+test("scout terminal classifier does not stop wp_comment on standalone anti-bot labels", () => {
+    const task = makeTask({
+        flow_family: "wp_comment",
+        target_url: "https://brownbagteacher.com/place-value-1st-grade-centers/",
+        hostname: "brownbagteacher.com",
+    });
+    const scout = makeScout({
+        surface_summary: "Comment form is visible on the article page.",
+        submit_candidates: ["Post Comment"],
+        field_hints: ["comment", "author", "email", "url"],
+        anti_bot_hints: ["captcha", "spam"],
+        embed_hints: [],
+        page_snapshot: {
+            url: "https://brownbagteacher.com/place-value-1st-grade-centers/",
+            title: "Place Value Centers",
+            response_status: 200,
+            body_text_excerpt: "Leave a Reply. Comment. Name. Email. Website. Post Comment.",
+        },
+        page_assessment: {
+            page_reachable: true,
+            visual_verification_required: true,
+            classification_confidence: "low",
+            ambiguity_flags: ["overlay_or_interstitial_present"],
+        },
+    });
+    const classification = classifyScoutTerminalBoundary({
+        task,
+        scout,
+        evidenceRef: "artifact.json",
+    });
+    assert.equal(classification, undefined);
 });
 test("scout terminal classifier does not front-load mixed submit/auth ambiguity", () => {
     const task = makeTask();
