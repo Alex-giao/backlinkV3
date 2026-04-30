@@ -24,6 +24,12 @@ const SHARED_ANTI_BOT_HINTS = [
   "recaptcha",
   "hcaptcha",
   "turnstile",
+  "confirmation code",
+  "security code",
+  "visual confirmation",
+  "Bestätigungscode",
+  "Bestätigung der Registrierung",
+  "automatisierte Anmeldungen",
 ] as const;
 
 const SHARED_OVERLAY_SIGNALS = [
@@ -41,7 +47,19 @@ const SHARED_OVERLAY_SIGNALS = [
 
 const SHARED_REASON_INFERENCE = {
   paidSignals: ["paid", "sponsored listing", "subscription", "sponsor", "sponsored", "pricing", "payment"],
-  captchaSignals: ["captcha", "recaptcha", "hcaptcha", "turnstile", "human verification", "security code", "visual confirmation"],
+  captchaSignals: [
+    "captcha",
+    "recaptcha",
+    "hcaptcha",
+    "turnstile",
+    "human verification",
+    "security code",
+    "confirmation code",
+    "visual confirmation",
+    "Bestätigungscode",
+    "Bestätigung der Registrierung",
+    "automatisierte Anmeldungen",
+  ],
   manualAuthSignals: ["login wall", "requires unsupported authentication", "password", "2fa", "passkey"],
   missingInputSignals: ["required input", "missing required fields", "required fields", "all fields are required"],
   staleSubmitSignals: ["stale submit path", "404_or_stale_submit_path"],
@@ -117,7 +135,18 @@ export const FORUM_POST_FAMILY: FamilyConfig = {
     formSignals: ["message", "reply", "bbcode", "signature", "website", "subject", "thread", "topic"],
     authSignals: SHARED_AUTH_HINTS,
     confirmationSignals: ["post submitted", "reply posted", "your post has been posted", "awaiting moderation", "moderator approval", "post is awaiting approval"],
-    captchaSignals: ["captcha", "verify you are human", "cloudflare", "anti spam", "flood control"],
+    captchaSignals: [
+      "captcha",
+      "verify you are human",
+      "cloudflare",
+      "anti spam",
+      "flood control",
+      "confirmation code",
+      "security code",
+      "visual confirmation",
+      "Bestätigungscode",
+      "automatisierte Anmeldungen",
+    ],
   },
   reasonInference: {
     terminalSuccessSignals: [],

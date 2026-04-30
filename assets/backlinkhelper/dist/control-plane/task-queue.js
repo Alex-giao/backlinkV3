@@ -323,7 +323,15 @@ const LIGHTWEIGHT_SITE_RESPONSE_FOLLOW_UP_REASON_CODES = new Set([
     "ARTICLE_SUBMITTED_PENDING_EDITORIAL",
     "ARTICLE_PUBLICATION_PENDING",
 ]);
+function isCaptchaSolverContinuationWait(task) {
+    return task.status === "WAITING_EXTERNAL_EVENT" && task.wait?.wait_reason_code === "CAPTCHA_SOLVER_CONTINUATION";
+}
 export function deriveTaskLane(task) {
+    if (isCaptchaSolverContinuationWait(task)) {
+        return resolveFlowFamily(task.flow_family) === "saas_directory"
+            ? "directory_active"
+            : "non_directory_active";
+    }
     if (FOLLOW_UP_STATUSES.has(task.status)) {
         return "follow_up";
     }
@@ -366,10 +374,13 @@ export function pickNextTaskForLane(tasks, lane = "active_any") {
     const readyTasks = tasks
         .filter((task) => task.status === "READY" && matchesClaimLane(task, lane))
         .sort(compareByQueuePriorityThenCreated);
+    const captchaContinuationTasks = tasks
+        .filter((task) => isCaptchaSolverContinuationWait(task) && matchesClaimLane(task, lane))
+        .sort(compareByQueuePriorityThenCreated);
     const retryableTasks = tasks
         .filter((task) => canRetry(task) && matchesClaimLane(task, lane))
         .sort(compareByQueuePriorityThenCreated);
-    return readyTasks[0] ?? retryableTasks[0];
+    return readyTasks[0] ?? captchaContinuationTasks[0] ?? retryableTasks[0];
 }
 export function buildTaskLaneReport(tasks) {
     const totals = {
@@ -1234,6 +1245,46 @@ async function reapExpiredWorkerLease(group) {
     };
     task.terminal_class = "outcome_not_confirmed";
     task.notes.push("bounded worker timed out");
+    updateTaskStatus(task, "RETRYABLE");
+    await saveTask(task);
+    return { reapedTaskId: task.id };
+}
+export async function recoverActiveWorkerLeaseAfterOperatorFailure(args = {}) {
+    await ensureDataDirectories();
+    const group = args.group ?? "active";
+    const existingLease = await loadWorkerLease(group);
+    if (!existingLease || (args.taskId && existingLease.task_id !== args.taskId)) {
+        return {};
+    }
+    await clearWorkerLease(group);
+    await clearPendingFinalize(existingLease.task_id);
+    const task = await loadTask(existingLease.task_id);
+    if (!task) {
+        return { reapedTaskId: existingLease.task_id };
+    }
+    task.lease_expires_at = undefined;
+    const detailSuffix = args.detail ? ` Detail: ${args.detail}` : "";
+    const canRestoreWaitingCheckpoint = group !== "active" && existingLease.previous_status && FOLLOW_UP_STATUSES.has(existingLease.previous_status);
+    if (canRestoreWaitingCheckpoint) {
+        task.wait = existingLease.previous_wait;
+        task.terminal_class = existingLease.previous_terminal_class;
+        task.skip_reason_code = existingLease.previous_skip_reason_code;
+        task.notes.push(`${group} worker failed before handoff; restored the waiting checkpoint.${detailSuffix}`);
+        updateTaskStatus(task, existingLease.previous_status);
+        await saveTask(task);
+        return { reapedTaskId: task.id };
+    }
+    task.wait = {
+        wait_reason_code: "TASK_TIMEOUT",
+        resume_trigger: args.detail
+            ? `The bounded operator failed before producing a handoff: ${args.detail}. It will be retried automatically.`
+            : "The bounded operator failed before producing a handoff and will be retried automatically.",
+        resolution_owner: "system",
+        resolution_mode: "auto_resume",
+        evidence_ref: getWorkerLeasePath(group),
+    };
+    task.terminal_class = "outcome_not_confirmed";
+    task.notes.push(`bounded worker failed before handoff${detailSuffix}`);
     updateTaskStatus(task, "RETRYABLE");
     await saveTask(task);
     return { reapedTaskId: task.id };

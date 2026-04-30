@@ -3,6 +3,7 @@ import { runFollowUpTick } from "./follow-up-tick.js";
 import { recordAgentTrace } from "./task-record-agent-trace.js";
 import { finalizeTask } from "./task-finalize.js";
 import { prepareTaskForAgent } from "./task-prepare.js";
+import { recoverActiveWorkerLeaseAfterOperatorFailure } from "./task-queue.js";
 import { runUnattendedScopeTick, } from "./unattended-scope-tick.js";
 function normalizeHostname(hostname) {
     return hostname?.trim().replace(/^www\./i, "").toLowerCase() || undefined;
@@ -283,6 +284,12 @@ function buildDeps(args, deps) {
         runOperator: runOperator,
         recordAgentTrace: deps.recordAgentTrace ?? recordAgentTrace,
         finalizeTask: deps.finalizeTask ?? finalizeTask,
+        handleOperatorFailure: deps.handleOperatorFailure ??
+            ((recoveryArgs) => recoverActiveWorkerLeaseAfterOperatorFailure({
+                taskId: recoveryArgs.taskId,
+                group: recoveryArgs.group ?? "active",
+                detail: recoveryArgs.error instanceof Error ? recoveryArgs.error.message : String(recoveryArgs.error),
+            })),
         runFollowUpTick: deps.runFollowUpTick ?? runFollowUpTick,
     };
 }
@@ -419,15 +426,36 @@ export async function runUnattendedCampaign(args, deps = {}) {
             continue;
         }
         activeTasksStarted += 1;
-        const envelope = await effectiveDeps.runOperator({
-            task: prepare.task,
-            prepare,
-            scope: scopeResult.scope,
-            owner: args.owner,
-            cdpUrl: args.cdpUrl,
-            promotedUrl: lockedScope.promotedUrl,
-            promotedHostname: lockedScope.promotedHostname,
-        });
+        let envelope;
+        try {
+            envelope = await effectiveDeps.runOperator({
+                task: prepare.task,
+                prepare,
+                scope: scopeResult.scope,
+                owner: args.owner,
+                cdpUrl: args.cdpUrl,
+                promotedUrl: lockedScope.promotedUrl,
+                promotedHostname: lockedScope.promotedHostname,
+            });
+        }
+        catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            const recovery = await effectiveDeps.handleOperatorFailure({
+                taskId,
+                error,
+                lease: scopeResult.lease,
+                group: scopeResult.lease?.group ?? "active",
+            });
+            events.push({
+                phase: "operator",
+                action: "runtime_failure",
+                task_id: taskId,
+                detail: recovery.reapedTaskId
+                    ? `${detail} Recovered worker lease for ${recovery.reapedTaskId}.`
+                    : `${detail} No active worker lease found to recover.`,
+            });
+            continue;
+        }
         events.push({ phase: "operator", task_id: taskId, detail: envelope.handoff.detail });
         const record = await effectiveDeps.recordAgentTrace({ taskId, envelope });
         events.push({

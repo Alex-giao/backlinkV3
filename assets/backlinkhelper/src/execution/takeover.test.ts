@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   UNATTENDED_POLICY,
+  applyCaptchaSolverOutcomeGuard,
   applyFamilySpecificOutcomeGuard,
   applySignupContinuationGuard,
   applyVisualVerificationGuard,
@@ -171,6 +172,53 @@ test("visual guard parks CAPTCHA/human verification in solver wait lane instead 
   assert.equal(guarded.wait?.wait_reason_code, "CAPTCHA_SOLVER_CONTINUATION");
   assert.equal(guarded.wait?.resolution_mode, "auto_resume");
   assert.equal(guarded.skip_reason_code, undefined);
+});
+
+test("captcha solver guard keeps empty phpBB registration forms resumable instead of submitting CAPTCHA-only state", () => {
+  const guarded = applyCaptchaSolverOutcomeGuard({
+    outcome: baseRetryableOutcome(),
+    evidenceRef: "artifact.json",
+    captchaSolverAttempt: {
+      attempted: false,
+      solved: false,
+      applied: false,
+      submitted: false,
+      provider: "capsolver",
+      captcha_kind: "recaptcha_v2",
+      submit_blocked: true,
+      submit_block_reason: "REGISTRATION_REQUIRED_FIELDS_EMPTY",
+      form_kind: "phpbb_registration",
+      missing_fields: ["username", "email", "password"],
+      detail: "phpBB registration form still has empty account fields before CAPTCHA submit.",
+    },
+  });
+
+  assert.equal(guarded.next_status, "WAITING_EXTERNAL_EVENT");
+  assert.equal(guarded.terminal_class, "captcha_blocked");
+  assert.equal(guarded.wait?.wait_reason_code, "CAPTCHA_SOLVER_CONTINUATION");
+  assert.equal(guarded.wait?.resolution_owner, "system");
+  assert.equal(guarded.wait?.resolution_mode, "auto_resume");
+  assert.match(guarded.detail, /full active worker/i);
+  assert.equal(guarded.skip_reason_code, undefined);
+});
+
+test("captcha solver guard leaves ordinary outcomes unchanged when submit was not blocked", () => {
+  const outcome = baseRetryableOutcome();
+  const guarded = applyCaptchaSolverOutcomeGuard({
+    outcome,
+    evidenceRef: "artifact.json",
+    captchaSolverAttempt: {
+      attempted: true,
+      solved: true,
+      applied: true,
+      submitted: true,
+      provider: "capsolver",
+      captcha_kind: "recaptcha_v2",
+      detail: "CAPTCHA solved and submitted.",
+    },
+  });
+
+  assert.equal(guarded, outcome);
 });
 
 test("visual guard upgrades retryable outcome to manual auth on clear login wall", () => {

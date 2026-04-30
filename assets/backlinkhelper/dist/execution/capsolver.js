@@ -164,6 +164,164 @@ export function extractImageText(solution) {
     }
     return undefined;
 }
+function compactWhitespace(value) {
+    return (value ?? "").replace(/\s+/g, " ").trim();
+}
+function normalizeControlCorpus(control) {
+    return compactWhitespace([
+        control.name,
+        control.id,
+        control.label,
+        control.placeholder,
+        control.type,
+    ].filter(Boolean).join(" ")).toLowerCase();
+}
+const CAPTCHA_FIELD_SIGNAL_PATTERN = /(?:captcha|recaptcha|turnstile|confirmation\s+code|confirm_code|security\s+code|verification\s+code|visual\s+confirmation|bestätigungscode|bestätigung\s+der\s+registrierung|automatisierte\s+anmeldungen|verify\s+you\s+are\s+human|i'?m\s+not\s+a\s+robot)/i;
+const REGISTRATION_SIGNAL_PATTERN = /(?:register|registration|create\s+account|sign\s+up|signup|registrierung|anmeldung)/i;
+const CONFIRM_FIELD_SIGNAL_PATTERN = /(?:confirm|confirmation|repeat|retype|bestätigen|bestaetigen|wiederholen)/i;
+function isUsableAccountControl(control) {
+    if (control.disabled) {
+        return false;
+    }
+    if (control.visible === false) {
+        return false;
+    }
+    const corpus = normalizeControlCorpus(control);
+    return !CAPTCHA_FIELD_SIGNAL_PATTERN.test(corpus);
+}
+function hasFilledValue(control) {
+    return typeof control.value === "string" && control.value.trim().length > 0;
+}
+function findControl(controls, predicate) {
+    return controls.find((control) => isUsableAccountControl(control) && predicate(control, normalizeControlCorpus(control)));
+}
+function findMissingIfPresent(controls, label, predicate, requiredIfPresent = true) {
+    const control = findControl(controls, predicate);
+    if (!control) {
+        return requiredIfPresent ? label : undefined;
+    }
+    return hasFilledValue(control) ? undefined : label;
+}
+function isPhpbbRegistrationForm(snapshot, form) {
+    const controls = form.controls ?? [];
+    const controlCorpus = controls.map(normalizeControlCorpus).join(" ");
+    const pageAndFormCorpus = compactWhitespace([
+        snapshot.pageUrl,
+        snapshot.title,
+        form.action,
+        form.id,
+        form.className,
+        form.text,
+        controlCorpus,
+    ].filter(Boolean).join(" ")).toLowerCase();
+    const hasPhpbbSignal = /ucp\.php(?:\?|$)/i.test(pageAndFormCorpus) ||
+        /\bphpbb\b/i.test(pageAndFormCorpus) ||
+        /\b(?:new_password|password_confirm|email_confirm|confirm_code)\b/i.test(pageAndFormCorpus);
+    const hasRegistrationSignal = REGISTRATION_SIGNAL_PATTERN.test(pageAndFormCorpus);
+    const hasRegistrationShape = hasPhpbbSignal || hasRegistrationSignal;
+    const hasCaptchaSignal = form.containsCaptcha === true || CAPTCHA_FIELD_SIGNAL_PATTERN.test(pageAndFormCorpus);
+    const hasUsername = Boolean(findControl(controls, (_control, corpus) => /\buser(?:name)?\b|\blogin name\b/.test(corpus)));
+    const hasEmail = Boolean(findControl(controls, (control, corpus) => control.type === "email" || /\be-?mail\b|\bemail\b/.test(corpus)));
+    const hasPassword = Boolean(findControl(controls, (control, corpus) => control.type === "password" || /\bpassword\b|\bpasswort\b/.test(corpus)));
+    return hasRegistrationShape && hasRegistrationSignal && hasCaptchaSignal && hasUsername && hasEmail && hasPassword;
+}
+function getPhpbbRegistrationMissingFields(form) {
+    const controls = form.controls ?? [];
+    const missing = [
+        findMissingIfPresent(controls, "username", (_control, corpus) => /\buser(?:name)?\b|\blogin name\b/.test(corpus)),
+        findMissingIfPresent(controls, "email", (control, corpus) => (control.type === "email" || /\be-?mail\b|\bemail\b/.test(corpus)) && !CONFIRM_FIELD_SIGNAL_PATTERN.test(corpus)),
+        findMissingIfPresent(controls, "confirm email", (_control, corpus) => CONFIRM_FIELD_SIGNAL_PATTERN.test(corpus) && /\be-?mail\b|\bemail\b/.test(corpus), false),
+        findMissingIfPresent(controls, "password", (control, corpus) => (control.type === "password" || /\bpassword\b|\bpasswort\b/.test(corpus)) &&
+            !CONFIRM_FIELD_SIGNAL_PATTERN.test(corpus) &&
+            !/\bcurrent\b/.test(corpus)),
+        findMissingIfPresent(controls, "confirm password", (_control, corpus) => CONFIRM_FIELD_SIGNAL_PATTERN.test(corpus) && /\bpassword\b|\bpasswort\b/.test(corpus), false),
+    ].filter((value) => Boolean(value));
+    return [...new Set(missing)];
+}
+export function assessCaptchaSubmitReadinessFromSnapshot(snapshot) {
+    for (const form of snapshot.forms ?? []) {
+        if (!isPhpbbRegistrationForm(snapshot, form)) {
+            continue;
+        }
+        const missingFields = getPhpbbRegistrationMissingFields(form);
+        if (missingFields.length > 0) {
+            return {
+                ready: false,
+                guarded: true,
+                form_kind: "phpbb_registration",
+                missing_fields: missingFields,
+                detail: `phpBB registration form still has empty account fields before CAPTCHA submit: ${missingFields.join(", ")}.`,
+            };
+        }
+        return {
+            ready: true,
+            guarded: true,
+            form_kind: "phpbb_registration",
+            missing_fields: [],
+            detail: "phpBB registration form account fields are filled; CAPTCHA submit is allowed.",
+        };
+    }
+    return {
+        ready: true,
+        guarded: false,
+        missing_fields: [],
+        detail: "No guarded CAPTCHA registration form was detected.",
+    };
+}
+export async function captureCaptchaSubmitReadinessSnapshot(page) {
+    return page.evaluate(() => {
+        const isVisible = (element) => {
+            if (!(element instanceof HTMLElement)) {
+                return false;
+            }
+            const style = window.getComputedStyle(element);
+            const rect = element.getBoundingClientRect();
+            return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || "1") > 0.05 && rect.width > 0 && rect.height > 0;
+        };
+        const labelFor = (control) => {
+            const labels = "labels" in control && control.labels ? [...control.labels].map((label) => label.textContent ?? "") : [];
+            const ariaLabel = control.getAttribute("aria-label") ?? "";
+            const ariaLabelledBy = (control.getAttribute("aria-labelledby") ?? "")
+                .split(/\s+/)
+                .map((id) => document.getElementById(id)?.textContent ?? "")
+                .join(" ");
+            return [labels.join(" "), ariaLabel, ariaLabelledBy].join(" ").replace(/\s+/g, " ").trim() || undefined;
+        };
+        const forms = [...document.forms].map((form) => {
+            const controls = [...form.querySelectorAll("input, textarea, select")].map((control) => ({
+                name: control.getAttribute("name") ?? undefined,
+                id: control.id || undefined,
+                label: labelFor(control),
+                placeholder: control.getAttribute("placeholder") ?? undefined,
+                type: control instanceof HTMLInputElement ? control.type : control.tagName.toLowerCase(),
+                value: control instanceof HTMLInputElement || control instanceof HTMLTextAreaElement || control instanceof HTMLSelectElement ? control.value : undefined,
+                required: control.required,
+                visible: isVisible(control),
+                disabled: control.disabled,
+            }));
+            const submitLabels = [...form.querySelectorAll('input[type="submit"], button[type="submit"], button:not([type])')]
+                .map((submit) => (submit instanceof HTMLInputElement ? submit.value : submit.textContent) ?? "")
+                .map((text) => text.replace(/\s+/g, " ").trim())
+                .filter(Boolean);
+            const corpus = [form.textContent, form.innerHTML].join(" ").toLowerCase();
+            return {
+                action: form.action || form.getAttribute("action") || undefined,
+                method: form.method || undefined,
+                id: form.id || undefined,
+                className: typeof form.className === "string" ? form.className : undefined,
+                text: (form.textContent ?? "").replace(/\s+/g, " ").trim(),
+                submitLabels,
+                containsCaptcha: /captcha|recaptcha|turnstile|cf-turnstile|g-recaptcha|confirmation\s+code|confirm_code|security\s+code|verification\s+code|visual\s+confirmation|bestätigungscode|bestätigung\s+der\s+registrierung|automatisierte\s+anmeldungen|verify\s+you\s+are\s+human/i.test(corpus),
+                controls,
+            };
+        });
+        return {
+            pageUrl: window.location.href,
+            title: document.title,
+            forms,
+        };
+    });
+}
 export async function detectTokenCaptchaDescriptor(page, websiteURL = page.url()) {
     return page.evaluate((url) => {
         const isVisible = (element) => {
@@ -371,6 +529,26 @@ export async function attemptCapsolverContinuation(args) {
             provider: "capsolver",
             detail: "No supported CAPTCHA descriptor was found on the current page.",
         };
+    }
+    if (args.submitAfterSolve) {
+        const readiness = await captureCaptchaSubmitReadinessSnapshot(args.page)
+            .then(assessCaptchaSubmitReadinessFromSnapshot)
+            .catch(() => undefined);
+        if (readiness && !readiness.ready) {
+            return {
+                attempted: false,
+                solved: false,
+                applied: false,
+                submitted: false,
+                provider: "capsolver",
+                captcha_kind: descriptor.kind,
+                submit_blocked: true,
+                submit_block_reason: "REGISTRATION_REQUIRED_FIELDS_EMPTY",
+                form_kind: readiness.form_kind,
+                missing_fields: readiness.missing_fields,
+                detail: `${readiness.detail} CapSolver was not invoked to avoid submitting an incomplete registration form.`,
+            };
+        }
     }
     const config = args.config ?? resolveCapsolverConfig();
     if (!config.enabled || !config.apiKey) {

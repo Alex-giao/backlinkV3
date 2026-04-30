@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { attemptCapsolverContinuation, CapsolverClient, buildCapsolverTask, extractImageText, extractSolutionToken, resolveCapsolverConfig, } from "./capsolver.js";
+import { assessCaptchaSubmitReadinessFromSnapshot, attemptCapsolverContinuation, CapsolverClient, buildCapsolverTask, extractImageText, extractSolutionToken, resolveCapsolverConfig, } from "./capsolver.js";
 test("CapSolver config enables unattended solver from env", () => {
     const config = resolveCapsolverConfig({
         CAPSOLVER_API_KEY: "key-123",
@@ -110,4 +110,193 @@ test("attemptCapsolverContinuation records missing Turnstile sitekey as bounded 
     assert.equal(result.captcha_kind, "turnstile");
     assert.equal(result.task_type, undefined);
     assert.match(result.detail, /missing websiteKey/);
+});
+test("assessCaptchaSubmitReadinessFromSnapshot blocks phpBB registration CAPTCHA submit when account fields are empty", () => {
+    const readiness = assessCaptchaSubmitReadinessFromSnapshot({
+        pageUrl: "https://forum.example.com/ucp.php?mode=register",
+        title: "Register",
+        forms: [
+            {
+                action: "https://forum.example.com/ucp.php?mode=register",
+                text: "Register Username Email address Password Confirm password Confirmation code Submit",
+                submitLabels: ["Submit"],
+                containsCaptcha: true,
+                controls: [
+                    { name: "username", label: "Username", value: "", visible: true },
+                    { name: "email", label: "Email address", value: "", visible: true, type: "email" },
+                    { name: "email_confirm", label: "Confirm email address", value: "", visible: true, type: "email" },
+                    { name: "new_password", label: "Password", value: "", visible: true, type: "password" },
+                    { name: "password_confirm", label: "Confirm password", value: "", visible: true, type: "password" },
+                    { name: "confirm_code", label: "Confirmation code", value: "", visible: true },
+                ],
+            },
+        ],
+    });
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.guarded, true);
+    assert.equal(readiness.form_kind, "phpbb_registration");
+    assert.deepEqual(readiness.missing_fields, ["username", "email", "confirm email", "password", "confirm password"]);
+    assert.match(readiness.detail, /phpBB registration form/i);
+});
+test("assessCaptchaSubmitReadinessFromSnapshot blocks phpBB registration CAPTCHA submit when localized security-code fields are empty", () => {
+    const readiness = assessCaptchaSubmitReadinessFromSnapshot({
+        pageUrl: "https://forum.example.com/ucp.php?mode=register",
+        title: "Registrierung",
+        forms: [
+            {
+                action: "https://forum.example.com/ucp.php?mode=register",
+                text: "Registrierung Benutzername E-Mail-Adresse Passwort Passwort bestätigen Bestätigungscode Visuelle Bestätigung Submit",
+                submitLabels: ["Submit"],
+                containsCaptcha: false,
+                controls: [
+                    { name: "username", label: "Benutzername", value: "", visible: true },
+                    { name: "email", label: "E-Mail-Adresse", value: "", visible: true, type: "email" },
+                    { name: "email_confirm", label: "E-Mail-Adresse bestätigen", value: "", visible: true, type: "email" },
+                    { name: "new_password", label: "Passwort", value: "", visible: true, type: "password" },
+                    { name: "password_confirm", label: "Passwort bestätigen", value: "", visible: true, type: "password" },
+                    { name: "confirm_code", label: "Bestätigungscode", value: "", visible: true },
+                ],
+            },
+        ],
+    });
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.guarded, true);
+    assert.equal(readiness.form_kind, "phpbb_registration");
+    assert.deepEqual(readiness.missing_fields, ["username", "email", "confirm email", "password", "confirm password"]);
+});
+test("assessCaptchaSubmitReadinessFromSnapshot blocks generic forum registration CAPTCHA submit with security-code fields empty", () => {
+    const readiness = assessCaptchaSubmitReadinessFromSnapshot({
+        pageUrl: "https://community.example.com/register",
+        title: "Create account",
+        forms: [
+            {
+                action: "https://community.example.com/register",
+                text: "Create account Username Email Password Repeat password Security code Submit",
+                submitLabels: ["Submit"],
+                containsCaptcha: false,
+                controls: [
+                    { name: "user", label: "Username", value: "", visible: true },
+                    { name: "mail", label: "Email", value: "", visible: true, type: "email" },
+                    { name: "pass", label: "Password", value: "", visible: true, type: "password" },
+                    { name: "pass_repeat", label: "Repeat password", value: "", visible: true, type: "password" },
+                    { name: "security_code", label: "Security code", value: "", visible: true },
+                ],
+            },
+        ],
+    });
+    assert.equal(readiness.ready, false);
+    assert.equal(readiness.guarded, true);
+    assert.equal(readiness.form_kind, "phpbb_registration");
+    assert.deepEqual(readiness.missing_fields, ["username", "email", "password", "confirm password"]);
+});
+test("assessCaptchaSubmitReadinessFromSnapshot allows phpBB registration CAPTCHA submit after required account fields are filled", () => {
+    const readiness = assessCaptchaSubmitReadinessFromSnapshot({
+        pageUrl: "https://forum.example.com/ucp.php?mode=register",
+        title: "Register",
+        forms: [
+            {
+                action: "https://forum.example.com/ucp.php?mode=register",
+                text: "Register Username Email address Password Confirm password Confirmation code Submit",
+                submitLabels: ["Submit"],
+                containsCaptcha: true,
+                controls: [
+                    { name: "username", label: "Username", value: "exactstatement", visible: true },
+                    { name: "email", label: "Email address", value: "support@example.com", visible: true, type: "email" },
+                    { name: "email_confirm", label: "Confirm email address", value: "support@example.com", visible: true, type: "email" },
+                    { name: "new_password", label: "Password", value: "secret-password", visible: true, type: "password" },
+                    { name: "password_confirm", label: "Confirm password", value: "secret-password", visible: true, type: "password" },
+                    { name: "confirm_code", label: "Confirmation code", value: "", visible: true },
+                ],
+            },
+        ],
+    });
+    assert.equal(readiness.ready, true);
+    assert.equal(readiness.guarded, true);
+    assert.equal(readiness.form_kind, "phpbb_registration");
+});
+test("attemptCapsolverContinuation does not solve or submit phpBB registration CAPTCHA while account fields are empty", async () => {
+    let solveCalled = false;
+    let clicked = false;
+    let evaluateCount = 0;
+    const page = {
+        url: () => "https://forum.example.com/ucp.php?mode=register",
+        evaluate: async () => {
+            evaluateCount += 1;
+            if (evaluateCount === 1) {
+                return {
+                    kind: "recaptcha_v2",
+                    websiteURL: "https://forum.example.com/ucp.php?mode=register",
+                    websiteKey: "site-key",
+                    detail: "Detected reCAPTCHA v2 sitekey site-key…",
+                };
+            }
+            return {
+                pageUrl: "https://forum.example.com/ucp.php?mode=register",
+                title: "Register",
+                forms: [
+                    {
+                        action: "https://forum.example.com/ucp.php?mode=register",
+                        text: "Register Username Email address Password Confirm password Confirmation code Submit",
+                        submitLabels: ["Submit"],
+                        containsCaptcha: true,
+                        controls: [
+                            { name: "username", label: "Username", value: "", visible: true },
+                            { name: "email", label: "Email address", value: "", visible: true, type: "email" },
+                            { name: "new_password", label: "Password", value: "", visible: true, type: "password" },
+                            { name: "password_confirm", label: "Confirm password", value: "", visible: true, type: "password" },
+                        ],
+                    },
+                ],
+            };
+        },
+        locator: () => ({
+            first() {
+                return this;
+            },
+            count: async () => 1,
+            isVisible: async () => true,
+            click: async () => {
+                clicked = true;
+            },
+            dispatchEvent: async () => {
+                clicked = true;
+            },
+        }),
+        waitForTimeout: async () => undefined,
+    };
+    const client = {
+        solve: async () => {
+            solveCalled = true;
+            return {
+                response: { errorId: 0, status: "ready", solution: { gRecaptchaResponse: "token-abc" } },
+                taskId: "task-1",
+                taskType: "ReCaptchaV2TaskProxyLess",
+                solution: { gRecaptchaResponse: "token-abc" },
+            };
+        },
+    };
+    const result = await attemptCapsolverContinuation({
+        page: page,
+        submitAfterSolve: true,
+        config: {
+            enabled: true,
+            apiKey: "secret",
+            createTaskUrl: "https://api.test/createTask",
+            getTaskResultUrl: "https://api.test/getTaskResult",
+            pollIntervalMs: 0,
+            maxPolls: 1,
+            requestTimeoutMs: 100,
+        },
+        client: client,
+    });
+    assert.equal(result.attempted, false);
+    assert.equal(result.solved, false);
+    assert.equal(result.applied, false);
+    assert.equal(result.submitted, false);
+    assert.equal(result.submit_blocked, true);
+    assert.equal(result.submit_block_reason, "REGISTRATION_REQUIRED_FIELDS_EMPTY");
+    assert.deepEqual(result.missing_fields, ["username", "email", "password", "confirm password"]);
+    assert.equal(solveCalled, false);
+    assert.equal(clicked, false);
+    assert.match(result.detail, /not invoked/i);
 });

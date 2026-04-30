@@ -4,6 +4,7 @@ import { runFollowUpTick } from "./follow-up-tick.js";
 import { recordAgentTrace } from "./task-record-agent-trace.js";
 import { finalizeTask } from "./task-finalize.js";
 import { prepareTaskForAgent } from "./task-prepare.js";
+import { recoverActiveWorkerLeaseAfterOperatorFailure } from "./task-queue.js";
 import {
   runUnattendedScopeTick,
   type UnattendedScopeTickArgs,
@@ -16,6 +17,8 @@ import type {
   FlowFamily,
   PrepareResult,
   TaskRecord,
+  WorkerLease,
+  WorkerLeaseGroup,
 } from "../shared/types.js";
 
 export type CampaignStopReason =
@@ -73,6 +76,7 @@ export interface UnattendedCampaignArgs {
 
 type FollowUpTickResult = Awaited<ReturnType<typeof runFollowUpTick>>;
 type RecordAgentTraceResult = Awaited<ReturnType<typeof recordAgentTrace>>;
+type OperatorFailureRecoveryResult = Awaited<ReturnType<typeof recoverActiveWorkerLeaseAfterOperatorFailure>>;
 
 export interface OperatorContext {
   task: TaskRecord;
@@ -90,6 +94,12 @@ export interface UnattendedCampaignDeps {
   runOperator?: (context: OperatorContext) => Promise<AgentTraceEnvelope>;
   recordAgentTrace?: (args: { taskId: string; envelope: AgentTraceEnvelope }) => Promise<RecordAgentTraceResult>;
   finalizeTask?: (args: { taskId: string; cdpUrl?: string }) => Promise<FinalizeResult>;
+  handleOperatorFailure?: (args: {
+    taskId: string;
+    error: unknown;
+    lease?: WorkerLease;
+    group?: WorkerLeaseGroup;
+  }) => Promise<OperatorFailureRecoveryResult>;
   runFollowUpTick?: (args: {
     owner: string;
     taskIdPrefix?: string;
@@ -419,6 +429,14 @@ function buildDeps(args: UnattendedCampaignArgs, deps: UnattendedCampaignDeps): 
     runOperator: runOperator as Required<UnattendedCampaignDeps>["runOperator"],
     recordAgentTrace: deps.recordAgentTrace ?? recordAgentTrace,
     finalizeTask: deps.finalizeTask ?? finalizeTask,
+    handleOperatorFailure:
+      deps.handleOperatorFailure ??
+      ((recoveryArgs) =>
+        recoverActiveWorkerLeaseAfterOperatorFailure({
+          taskId: recoveryArgs.taskId,
+          group: recoveryArgs.group ?? "active",
+          detail: recoveryArgs.error instanceof Error ? recoveryArgs.error.message : String(recoveryArgs.error),
+        })),
     runFollowUpTick: deps.runFollowUpTick ?? runFollowUpTick,
   };
 }
@@ -578,15 +596,35 @@ export async function runUnattendedCampaign(
     }
 
     activeTasksStarted += 1;
-    const envelope = await effectiveDeps.runOperator({
-      task: prepare.task,
-      prepare,
-      scope: scopeResult.scope,
-      owner: args.owner,
-      cdpUrl: args.cdpUrl,
-      promotedUrl: lockedScope.promotedUrl,
-      promotedHostname: lockedScope.promotedHostname,
-    });
+    let envelope: AgentTraceEnvelope;
+    try {
+      envelope = await effectiveDeps.runOperator({
+        task: prepare.task,
+        prepare,
+        scope: scopeResult.scope,
+        owner: args.owner,
+        cdpUrl: args.cdpUrl,
+        promotedUrl: lockedScope.promotedUrl,
+        promotedHostname: lockedScope.promotedHostname,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const recovery = await effectiveDeps.handleOperatorFailure({
+        taskId,
+        error,
+        lease: scopeResult.lease,
+        group: scopeResult.lease?.group ?? "active",
+      });
+      events.push({
+        phase: "operator",
+        action: "runtime_failure",
+        task_id: taskId,
+        detail: recovery.reapedTaskId
+          ? `${detail} Recovered worker lease for ${recovery.reapedTaskId}.`
+          : `${detail} No active worker lease found to recover.`,
+      });
+      continue;
+    }
     events.push({ phase: "operator", task_id: taskId, detail: envelope.handoff.detail });
 
     const record = await effectiveDeps.recordAgentTrace({ taskId, envelope });

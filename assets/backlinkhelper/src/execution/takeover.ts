@@ -286,6 +286,28 @@ function buildCaptchaSolverContinuationOutcome(evidenceRef: string, detail?: str
   };
 }
 
+export function applyCaptchaSolverOutcomeGuard(args: {
+  outcome: ProposedOutcome;
+  captchaSolverAttempt?: CapsolverAttemptRecord;
+  evidenceRef: string;
+}): ProposedOutcome {
+  if (
+    args.captchaSolverAttempt?.submit_blocked !== true ||
+    args.captchaSolverAttempt.submit_block_reason !== "REGISTRATION_REQUIRED_FIELDS_EMPTY"
+  ) {
+    return args.outcome;
+  }
+
+  const missingFields = Array.isArray(args.captchaSolverAttempt.missing_fields)
+    ? args.captchaSolverAttempt.missing_fields.filter((field): field is string => typeof field === "string" && field.trim().length > 0)
+    : [];
+  const fieldDetail = missingFields.length > 0 ? ` Missing account fields: ${missingFields.join(", ")}.` : "";
+  return buildCaptchaSolverContinuationOutcome(
+    args.evidenceRef,
+    `${args.captchaSolverAttempt.detail}${fieldDetail} Keep the task resumable by the full active worker; do not submit a CAPTCHA-only empty registration form.`,
+  );
+}
+
 function buildManualAuthOutcome(evidenceRef: string, detail?: string): ProposedOutcome {
   return {
     next_status: "WAITING_MANUAL_AUTH",
@@ -2552,12 +2574,17 @@ export async function runTakeoverFinalization(args: {
           title,
           bodyText,
         });
-        const guardedOutcome = applyFamilySpecificOutcomeGuard({
+        const familyGuardedOutcome = applyFamilySpecificOutcomeGuard({
           outcome: signupGuardedOutcome,
           flowFamily: args.task.flow_family,
           bodyText,
           evidenceRef: artifactPath,
           linkVerification,
+        });
+        const guardedOutcome = applyCaptchaSolverOutcomeGuard({
+          outcome: familyGuardedOutcome,
+          captchaSolverAttempt,
+          evidenceRef: artifactPath,
         });
 
         await writeJsonFile(artifactPath, {

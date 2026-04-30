@@ -14,11 +14,21 @@ import {
   matchesTaskScope,
   pickNextTaskForLane,
   parkExhaustedRetryableTask,
+  recoverActiveWorkerLeaseAfterOperatorFailure,
   resolveWorkerLeaseGroupForLane,
   shouldDeferHostReactivation,
   shouldReactivateRuntimeRetries,
 } from "./task-queue.js";
-import type { TaskRecord } from "../shared/types.js";
+import {
+  __setActiveDataStoreForTest,
+  loadTask,
+  loadWorkerLease,
+  saveTask,
+  saveWorkerLease,
+  type DataStoreBackend,
+  type TargetSiteRecord,
+} from "../memory/data-store.js";
+import type { AccountRecord, CredentialVaultRecord, TaskRecord, WorkerLease, WorkerLeaseGroup } from "../shared/types.js";
 
 function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
   return {
@@ -49,6 +59,173 @@ function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
   };
 }
 
+function cloneJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function createInMemoryDataStore(): DataStoreBackend {
+  const tasks = new Map<string, TaskRecord>();
+  const leases = new Map<WorkerLeaseGroup, WorkerLease>();
+  const accounts = new Map<string, AccountRecord>();
+  const credentials = new Map<string, CredentialVaultRecord>();
+  const targetSites = new Map<string, TargetSiteRecord>();
+
+  return {
+    kind: "file",
+    ensureDataDirectories: async () => {},
+    loadTask: async (taskId: string) => (tasks.has(taskId) ? cloneJson(tasks.get(taskId) as TaskRecord) : undefined),
+    saveTask: async (task: TaskRecord) => {
+      tasks.set(task.id, cloneJson(task));
+    },
+    listTasks: async () => [...tasks.values()].map((task) => cloneJson(task)),
+    loadWorkerLease: async (group: WorkerLeaseGroup = "active") => (leases.has(group) ? cloneJson(leases.get(group) as WorkerLease) : undefined),
+    loadAllWorkerLeases: async () => ({
+      active: leases.has("active") ? cloneJson(leases.get("active") as WorkerLease) : undefined,
+      follow_up: leases.has("follow_up") ? cloneJson(leases.get("follow_up") as WorkerLease) : undefined,
+    }),
+    saveWorkerLease: async (lease: WorkerLease, group: WorkerLeaseGroup = lease.group ?? "active") => {
+      leases.set(group, cloneJson({ ...lease, group }));
+    },
+    clearWorkerLease: async (group: WorkerLeaseGroup = "active") => {
+      leases.delete(group);
+    },
+    clearWorkerLeaseForTask: async (taskId: string) => {
+      let cleared = false;
+      for (const [group, lease] of [...leases.entries()]) {
+        if (lease.task_id === taskId) {
+          leases.delete(group);
+          cleared = true;
+        }
+      }
+      return cleared;
+    },
+    loadAccountRecord: async (hostname: string) => (accounts.has(hostname) ? cloneJson(accounts.get(hostname) as AccountRecord) : undefined),
+    saveAccountRecord: async (account: AccountRecord) => {
+      accounts.set(account.hostname, cloneJson(account));
+    },
+    loadCredentialRecord: async (credentialRef: string) => (credentials.has(credentialRef) ? cloneJson(credentials.get(credentialRef) as CredentialVaultRecord) : undefined),
+    saveCredentialRecord: async (record: CredentialVaultRecord) => {
+      credentials.set(record.credential_ref, cloneJson(record));
+    },
+    deleteCredentialRecord: async (credentialRef: string) => {
+      credentials.delete(credentialRef);
+    },
+    upsertTargetSite: async (target: TargetSiteRecord) => {
+      targetSites.set(target.hostname, cloneJson(target));
+    },
+    listTargetSites: async (limit = 100) => [...targetSites.values()].slice(0, limit).map((target) => cloneJson(target)),
+  };
+}
+
+function makeWorkerLease(taskId: string, overrides: Partial<WorkerLease> = {}): WorkerLease {
+  return {
+    task_id: taskId,
+    owner: "test-worker",
+    acquired_at: "2026-04-08T00:00:00.000Z",
+    expires_at: "2026-04-08T00:10:00.000Z",
+    group: "active",
+    lane: "active_any",
+    previous_status: "READY",
+    ...overrides,
+  };
+}
+
+test("recoverActiveWorkerLeaseAfterOperatorFailure clears the active lease and parks the task as retryable", async () => {
+  const store = createInMemoryDataStore();
+  __setActiveDataStoreForTest(store);
+  try {
+    const task = makeTask({
+      status: "RUNNING",
+      run_count: 1,
+      lease_expires_at: "2026-04-08T00:10:00.000Z",
+      wait: undefined,
+    });
+    await saveTask(task);
+    await saveWorkerLease(makeWorkerLease(task.id));
+
+    const result = await recoverActiveWorkerLeaseAfterOperatorFailure({
+      taskId: task.id,
+      detail: "Operator command timed out after 100ms.",
+    });
+
+    const recovered = await loadTask(task.id);
+    assert.equal(result.reapedTaskId, task.id);
+    assert.equal(await loadWorkerLease("active"), undefined);
+    assert.equal(recovered?.status, "RETRYABLE");
+    assert.equal(recovered?.lease_expires_at, undefined);
+    assert.equal(recovered?.wait?.wait_reason_code, "TASK_TIMEOUT");
+    assert.equal(recovered?.wait?.resolution_owner, "system");
+    assert.equal(recovered?.wait?.resolution_mode, "auto_resume");
+    assert.equal(recovered?.terminal_class, "outcome_not_confirmed");
+    assert.match(recovered?.notes.join("\n") ?? "", /bounded worker failed before handoff/);
+  } finally {
+    __setActiveDataStoreForTest(undefined);
+  }
+});
+
+test("recoverActiveWorkerLeaseAfterOperatorFailure parks active-lane CAPTCHA continuations as timeout retryables", async () => {
+  const store = createInMemoryDataStore();
+  __setActiveDataStoreForTest(store);
+  try {
+    const previousWait = {
+      wait_reason_code: "CAPTCHA_SOLVER_CONTINUATION" as const,
+      resume_trigger: "captcha solver can continue",
+      resolution_owner: "system" as const,
+      resolution_mode: "auto_resume" as const,
+      evidence_ref: "captcha.json",
+    };
+    const task = makeTask({
+      status: "RUNNING",
+      flow_family: "forum_post",
+      wait: previousWait,
+      lease_expires_at: "2026-04-08T00:10:00.000Z",
+    });
+    await saveTask(task);
+    await saveWorkerLease(
+      makeWorkerLease(task.id, {
+        previous_status: "WAITING_EXTERNAL_EVENT",
+        previous_wait: previousWait,
+      }),
+    );
+
+    const result = await recoverActiveWorkerLeaseAfterOperatorFailure({
+      taskId: task.id,
+      detail: "Operator command timed out after 100ms.",
+    });
+
+    const recovered = await loadTask(task.id);
+    assert.equal(result.reapedTaskId, task.id);
+    assert.equal(await loadWorkerLease("active"), undefined);
+    assert.equal(recovered?.status, "RETRYABLE");
+    assert.equal(recovered?.wait?.wait_reason_code, "TASK_TIMEOUT");
+    assert.notEqual(recovered?.wait?.wait_reason_code, "CAPTCHA_SOLVER_CONTINUATION");
+    assert.match(recovered?.wait?.resume_trigger ?? "", /bounded operator failed/i);
+  } finally {
+    __setActiveDataStoreForTest(undefined);
+  }
+});
+
+test("recoverActiveWorkerLeaseAfterOperatorFailure does not clear a lease owned by another task", async () => {
+  const store = createInMemoryDataStore();
+  __setActiveDataStoreForTest(store);
+  try {
+    const task = makeTask({ id: "task-active-owner", status: "RUNNING" });
+    await saveTask(task);
+    await saveWorkerLease(makeWorkerLease(task.id));
+
+    const result = await recoverActiveWorkerLeaseAfterOperatorFailure({
+      taskId: "task-unrelated-failure",
+      detail: "operator failed elsewhere",
+    });
+
+    assert.equal(result.reapedTaskId, undefined);
+    assert.equal((await loadWorkerLease("active"))?.task_id, task.id);
+    assert.equal((await loadTask(task.id))?.status, "RUNNING");
+  } finally {
+    __setActiveDataStoreForTest(undefined);
+  }
+});
+
 test("deriveTaskLane routes active and waiting tasks into the expected logical lanes", () => {
   assert.equal(
     deriveTaskLane(makeTask({ status: "READY", run_count: 0, flow_family: "saas_directory" })),
@@ -71,6 +248,37 @@ test("deriveTaskLane routes active and waiting tasks into the expected logical l
     "follow_up",
   );
   assert.equal(deriveTaskLane(makeTask({ status: "WAITING_MANUAL_AUTH", flow_family: "wp_comment" })), undefined);
+});
+
+test("CAPTCHA solver continuation waits route back to the full active worker instead of lightweight follow-up", () => {
+  const captchaContinuation = makeTask({
+    id: "captcha-task",
+    status: "WAITING_EXTERNAL_EVENT",
+    flow_family: "forum_post",
+    wait: {
+      wait_reason_code: "CAPTCHA_SOLVER_CONTINUATION",
+      resume_trigger: "Continue solving the visible CAPTCHA challenge.",
+      resolution_owner: "system",
+      resolution_mode: "auto_resume",
+      evidence_ref: "captcha.json",
+    },
+  });
+  const emailContinuation = makeTask({
+    id: "email-task",
+    status: "WAITING_EXTERNAL_EVENT",
+    flow_family: "forum_post",
+    wait: {
+      wait_reason_code: "EMAIL_VERIFICATION_PENDING",
+      resume_trigger: "Wait for the verification email.",
+      resolution_owner: "gog",
+      resolution_mode: "auto_resume",
+      evidence_ref: "email.json",
+    },
+  });
+
+  assert.equal(deriveTaskLane(captchaContinuation), "non_directory_active");
+  assert.equal(pickNextTaskForLane([emailContinuation, captchaContinuation], "active_any")?.id, "captcha-task");
+  assert.equal(pickNextTaskForLane([captchaContinuation], "follow_up"), undefined);
 });
 
 test("deriveFlowFamilyAudit records explicit and defaulted family provenance for new tasks", () => {

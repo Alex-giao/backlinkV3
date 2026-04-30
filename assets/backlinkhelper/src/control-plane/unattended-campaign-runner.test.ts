@@ -290,6 +290,62 @@ test("runUnattendedCampaign loops intake enqueue -> claim -> prepare -> operator
   assert.equal(result.events.at(-1)?.phase, "stop");
 });
 
+test("runUnattendedCampaign recovers the active lease when the operator fails before handoff", async () => {
+  const task = makeTask();
+  const lease = makeLease(task.id);
+  const calls: string[] = [];
+
+  const result = await runUnattendedCampaign(
+    {
+      owner: "campaign-runner-test",
+      promotedUrl: "https://promo.example/",
+      maxActiveTasks: 1,
+    },
+    {
+      runScopeTick: async () => {
+        calls.push("scope");
+        return {
+          action: "claimed",
+          scope: { promotedHostname: "promo.example", promotedUrl: "https://promo.example/" },
+          detail: "Claimed scoped task.",
+          task,
+          lease,
+        };
+      },
+      prepareTask: async (args: { taskId: string }) => {
+        calls.push(`prepare:${args.taskId}`);
+        return makeReadyPrepare(task);
+      },
+      runOperator: async () => {
+        calls.push("operator");
+        throw new Error("Operator command timed out after 100ms.");
+      },
+      handleOperatorFailure: async (args: { taskId: string; error: unknown; lease?: WorkerLease }) => {
+        calls.push(`recover:${args.taskId}`);
+        assert.equal(args.taskId, task.id);
+        assert.equal(args.lease, lease);
+        assert.match(args.error instanceof Error ? args.error.message : String(args.error), /timed out/);
+        return { reapedTaskId: task.id };
+      },
+      recordAgentTrace: async () => {
+        throw new Error("recordAgentTrace should not run after operator failure");
+      },
+      finalizeTask: async () => {
+        throw new Error("finalizeTask should not run after operator failure");
+      },
+      runFollowUpTick: async () => {
+        throw new Error("runFollowUpTick should not run after operator failure");
+      },
+    },
+  );
+
+  assert.deepEqual(calls, ["scope", `prepare:${task.id}`, "operator", `recover:${task.id}`]);
+  assert.equal(result.stop_reason, "max_active_tasks");
+  assert.equal(result.active_tasks_started, 1);
+  assert.equal(result.active_tasks_finalized, 0);
+  assert.equal(result.events.some((event) => event.phase === "operator" && event.action === "runtime_failure"), true);
+});
+
 test("runUnattendedCampaign keeps pulling candidates after task-prepare stops a claimed task", async () => {
   const stoppedTask = makeTask({
     id: "campaign-0001-dead-target",

@@ -144,11 +144,15 @@ test("buildFamilyOperatorPrompt carries family contract and forbids claiming/fin
   assert.match(prompt, /family:\s*forum_post/i);
   assert.match(prompt, /Do not skip solely because the promoted site is topically different/i);
   assert.match(prompt, /bridge comment/i);
+  assert.match(prompt, /prequalified backlink surfaces from competitor evidence/i);
+  assert.match(prompt, /Do not proactively research or stop on generic site terms/i);
   assert.doesNotMatch(prompt, /Do not create spammy off-topic posts just to place a link/i);
   assert.match(prompt, /Do not run claim-next-task/i);
   assert.match(prompt, /Do not run task-finalize/i);
   assert.match(prompt, /AgentTraceEnvelope JSON/i);
   assert.match(prompt, /proposed_outcome\.next_status/i);
+  assert.match(prompt, /CAPTCHA_SOLVER_CONTINUATION/);
+  assert.match(prompt, /Bestätigungscode/);
 });
 
 test("suika unattended watchdog uses the family-aware dispatcher, not the Blogger-only operator directly", () => {
