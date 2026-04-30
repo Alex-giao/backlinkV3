@@ -21,6 +21,41 @@ function updateTaskStatus(task, status) {
 export function reclassifyTaskFlowFamilyForPrepare(task, reasonPrefix = "task-prepare target classification") {
     return applyTargetFlowFamilyClassificationToTask({ task, reasonPrefix });
 }
+function scoutHasBloggerCommentFrame(scout) {
+    return (scout.embed_hints ?? []).some((hint) => {
+        const frameUrl = (hint.frame_url ?? "").toLowerCase();
+        const bodyText = (hint.body_text_excerpt ?? "").toLowerCase();
+        const isBloggerCommentFrame = frameUrl.includes("blogger.com/comment/frame") || frameUrl.includes("draft.blogger.com/comment/frame");
+        if (!isBloggerCommentFrame) {
+            return false;
+        }
+        return (bodyText.includes("enter comment") ||
+            bodyText.includes("leave a comment") ||
+            bodyText.includes("sign in with google") ||
+            bodyText.includes("comment"));
+    });
+}
+export function reclassifyTaskFlowFamilyFromScout(task, scout, reasonPrefix = "task-prepare scout classification") {
+    if (!scout.ok || !scoutHasBloggerCommentFrame(scout) || task.flow_family === "wp_comment") {
+        return false;
+    }
+    const previousFamily = task.flow_family;
+    const reason = previousFamily
+        ? `${reasonPrefix}: Scout detected a Blogger comment frame; corrected flow family from ${previousFamily} to wp_comment.`
+        : `${reasonPrefix}: Scout detected a Blogger comment frame; inferred flow family wp_comment.`;
+    task.flow_family = "wp_comment";
+    task.flow_family_source = previousFamily ? "corrected" : "inferred";
+    task.flow_family_reason = reason;
+    task.flow_family_updated_at = new Date().toISOString();
+    if (previousFamily) {
+        task.corrected_from_family = previousFamily;
+    }
+    else {
+        delete task.corrected_from_family;
+    }
+    task.notes.push(reason);
+    return true;
+}
 function inferRegistrationRequired(task, scoutTextHints) {
     if (!task.submission.submitter_email) {
         return false;
@@ -234,6 +269,12 @@ function buildScoutTerminalBoundaryText(scout) {
         .filter((value) => typeof value === "string" && value.trim().length > 0)
         .join("\n");
 }
+function scoutHasMixedSubmitAuthSignals(scout) {
+    const ambiguityFlags = scout.page_assessment?.ambiguity_flags ?? [];
+    return (ambiguityFlags.includes("mixed_submit_and_auth_signals") ||
+        ambiguityFlags.includes("login_vs_register_ambiguous") ||
+        ((scout.submit_candidates?.length ?? 0) > 0 && (scout.auth_hints?.length ?? 0) > 0));
+}
 export function classifyScoutTerminalBoundary(args) {
     if (!args.scout.ok || args.scout.page_assessment?.page_reachable !== true) {
         return undefined;
@@ -251,6 +292,9 @@ export function classifyScoutTerminalBoundary(args) {
         "WAITING_MANUAL_AUTH",
         "WAITING_MISSING_INPUT",
     ]);
+    if (classification.outcome.next_status === "WAITING_MANUAL_AUTH" && scoutHasMixedSubmitAuthSignals(args.scout)) {
+        return undefined;
+    }
     if (classification.outcome.wait?.wait_reason_code === "CAPTCHA_BLOCKED" && scoutHasSolverSupportedCaptcha(args.scout)) {
         return undefined;
     }
@@ -458,6 +502,11 @@ export async function prepareTaskForAgent(args) {
             task.latest_artifacts.push(scoutArtifactPath);
         }
         task.notes.push(scout.surface_summary);
+        if (reclassifyTaskFlowFamilyFromScout(task, scout, "task-prepare scout")) {
+            scout = await runLightweightScout({ runtime, task });
+            await writeJsonFile(scoutArtifactPath, scout);
+            task.notes.push(`Rescout after flow-family correction: ${scout.surface_summary}`);
+        }
         let recoveredTargetUrl = pickRecoveredTargetUrl(task, scout);
         task.homepage_recovery_used = false;
         task.recovered_target_url = undefined;

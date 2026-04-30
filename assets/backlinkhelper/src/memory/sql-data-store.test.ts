@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { createSqliteDataStore } from "./sqlite-data-store.js";
 import { __setActiveDataStoreForTest, listTargetSites, upsertTargetSite } from "./data-store.js";
+import type { SqlExecutor } from "./sql-data-store.js";
 import type { AccountRecord, TaskRecord, WorkerLease } from "../shared/types.js";
 
 function buildTask(id = "task-sql-1"): TaskRecord {
@@ -96,4 +97,32 @@ test("active datastore facade can upsert target-site seed data", async () => {
   } finally {
     __setActiveDataStoreForTest(undefined);
   }
+});
+
+test("sql target-site listing reconstructs scalar columns when payload_json is metadata only", async () => {
+  const store = createSqliteDataStore(":memory:");
+  await store.ensureDataDirectories();
+  const executor = (store as unknown as { executor: SqlExecutor }).executor;
+  await executor.run(
+    `INSERT INTO target_sites (
+      target_url, hostname, source, flow_family_hint, submit_status, imported_at, last_task_id, payload_json
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      "https://metadata.example/resources",
+      "metadata.example",
+      "unit-test-csv",
+      null,
+      "needs_classification",
+      "2026-04-24T00:00:00.000Z",
+      null,
+      JSON.stringify({ target_url: "metadata-only", row_index: 1 }),
+    ],
+  );
+
+  const sites = await store.listTargetSites(10);
+  assert.equal(sites.length, 1);
+  assert.equal(sites[0]?.target_url, "https://metadata.example/resources");
+  assert.equal(sites[0]?.hostname, "metadata.example");
+  assert.equal(sites[0]?.submit_status, "needs_classification");
+  assert.equal(sites[0]?.payload?.target_url, "metadata-only");
 });

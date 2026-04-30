@@ -145,6 +145,96 @@ test("runUnattendedScopeTick enqueues one safe global target-site candidate when
   assert.equal(targetSites[0]?.last_task_id, result.task?.id);
 });
 
+test("runUnattendedScopeTick marks ambiguous unhinted candidates as needs_classification instead of defaulting to directory", async () => {
+  const { tick, store } = await getHarness();
+  await resetHarness();
+
+  await store.upsertTargetSite({
+    target_url: "https://ambiguous.example/resources",
+    hostname: "ambiguous.example",
+    source: "test",
+    submit_status: "candidate",
+    imported_at: "2026-04-22T00:00:00.000Z",
+  });
+
+  const result = await tick.runUnattendedScopeTick({
+    owner: "test-owner",
+    taskIdPrefix: "scope-unknown",
+    promotedHostname: "promo.example",
+    promotedUrl: "https://promo.example/",
+    submitterEmailBase: "operator@example.com",
+  });
+
+  assert.equal(result.action, "needs_classification");
+  assert.equal(result.task, undefined);
+  assert.equal(result.counts?.candidate_pool, 1);
+  assert.equal(result.counts?.safe_candidates, 0);
+
+  const tasks = await store.listTasks();
+  assert.equal(tasks.length, 0);
+
+  const targetSites = await store.listTargetSites(10);
+  assert.equal(targetSites[0]?.submit_status, "needs_classification");
+  assert.equal(targetSites[0]?.flow_family_hint, undefined);
+  assert.equal(targetSites[0]?.payload?.surface_diagnosis && typeof targetSites[0].payload.surface_diagnosis, "object");
+});
+
+test("runUnattendedScopeTick can enqueue unhinted candidates when URL evidence gives a strong family", async () => {
+  const { tick, store } = await getHarness();
+  await resetHarness();
+
+  await store.upsertTargetSite({
+    target_url: "https://faithfulprovisions.com/8-ways-to-drink-more-water-every-day/",
+    hostname: "faithfulprovisions.com",
+    source: "test",
+    submit_status: "candidate",
+    imported_at: "2026-04-22T00:00:00.000Z",
+  });
+
+  const result = await tick.runUnattendedScopeTick({
+    owner: "test-owner",
+    taskIdPrefix: "scope-inferred",
+    promotedHostname: "promo.example",
+    promotedUrl: "https://promo.example/",
+    submitterEmailBase: "operator@example.com",
+  });
+
+  assert.equal(result.action, "enqueued");
+  assert.equal(result.task?.flow_family, "wp_comment");
+  assert.equal(result.task?.flow_family_source, "inferred");
+
+  const targetSites = await store.listTargetSites(10);
+  assert.equal(targetSites[0]?.submit_status, "enqueued");
+  assert.equal(targetSites[0]?.flow_family_hint, "wp_comment");
+});
+
+test("runUnattendedScopeTick preserves inferred provenance from older imported target-site rows", async () => {
+  const { tick, store } = await getHarness();
+  await resetHarness();
+
+  await store.upsertTargetSite({
+    target_url: "https://faithfulprovisions.com/8-ways-to-drink-more-water-every-day/",
+    hostname: "faithfulprovisions.com",
+    source: "test",
+    flow_family_hint: "wp_comment",
+    submit_status: "candidate",
+    imported_at: "2026-04-22T00:00:00.000Z",
+    payload: { flow_family_source: "inferred" },
+  });
+
+  const result = await tick.runUnattendedScopeTick({
+    owner: "test-owner",
+    taskIdPrefix: "scope-legacy-inferred",
+    promotedHostname: "promo.example",
+    promotedUrl: "https://promo.example/",
+    submitterEmailBase: "operator@example.com",
+  });
+
+  assert.equal(result.action, "enqueued");
+  assert.equal(result.task?.flow_family, "wp_comment");
+  assert.equal(result.task?.flow_family_source, "inferred");
+});
+
 test("runUnattendedScopeTick ignores db-smoke target-site rows even if they are candidate", async () => {
   const { tick, store } = await getHarness();
   await resetHarness();

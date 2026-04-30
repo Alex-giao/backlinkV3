@@ -94,6 +94,16 @@ function buildCaptchaSkipOutcome(evidenceRef) {
         skip_reason_code: "captcha_or_human_verification_required",
     };
 }
+function buildCaptchaSolverContinuationOutcome(evidenceRef, detail) {
+    const continuationDetail = detail ??
+        "CAPTCHA or managed human verification was detected; keep this task in the auto-resume lane for the configured CAPTCHA solver instead of closing it as skipped.";
+    return {
+        next_status: "WAITING_EXTERNAL_EVENT",
+        detail: continuationDetail,
+        wait: inferAutoResumeWait("CAPTCHA_SOLVER_CONTINUATION", "system", continuationDetail, evidenceRef),
+        terminal_class: "captcha_blocked",
+    };
+}
 function buildManualAuthOutcome(evidenceRef, detail) {
     return {
         next_status: "WAITING_MANUAL_AUTH",
@@ -311,18 +321,36 @@ function describeVisualVerification(visual) {
     return `Visual verification${modelPart} confidence=${visual.confidence.toFixed(2)} classified the reachable page as ${visual.classification}: ${visual.summary}`;
 }
 function isAllowedGoogleOauthTransition(bodyText, currentUrl) {
+    if (!UNATTENDED_POLICY.allow_google_oauth_chooser) {
+        return false;
+    }
     const normalized = bodyText.toLowerCase();
-    return (UNATTENDED_POLICY.allow_google_oauth_chooser &&
-        (currentUrl.includes("accounts.google.com") ||
-            normalized.includes("continue with google") ||
-            normalized.includes("login with google") ||
-            normalized.includes("sign in with google")));
+    const currentUrlLower = currentUrl.toLowerCase();
+    if (currentUrlLower.includes("accounts.google.com")) {
+        return true;
+    }
+    return /\b(?:continue|sign[ -]?in|log[ -]?in|login|sign[ -]?up|register|join|use|connect)\s+(?:with|using|via)\s+google\b/.test(normalized) || /\bwith google\b/.test(normalized) || /\bgoogle account\b/.test(normalized);
+}
+function escapeRegExpLiteral(value) {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function containsNormalizedSignal(normalized, needle) {
+    const normalizedNeedle = needle.toLowerCase().trim();
+    if (!normalizedNeedle) {
+        return false;
+    }
+    // Short auth tokens such as "2fa" are noisy in encoded iframe URLs
+    // (%2Fabc..., %2Fa...) and should only count as standalone visible text.
+    if (/^[a-z0-9]+$/.test(normalizedNeedle) && normalizedNeedle.length <= 4) {
+        return new RegExp(`(?:^|[^a-z0-9])${escapeRegExpLiteral(normalizedNeedle)}(?![a-z0-9])`).test(normalized);
+    }
+    return normalized.includes(normalizedNeedle);
 }
 export function classifyEarlyTerminalOutcome(args) {
     const normalized = args.bodyText.toLowerCase();
     const boundaryCorpus = `${args.currentUrl} ${args.title ?? ""}`.toLowerCase();
     const familyConfig = getFamilyConfig(args.flowFamily);
-    const containsAny = (needles) => needles.some((needle) => normalized.includes(needle));
+    const containsAny = (needles) => needles.some((needle) => containsNormalizedSignal(normalized, needle));
     const boundaryHasAny = (needles) => needles.some((needle) => boundaryCorpus.includes(needle.toLowerCase()));
     const isForumProfileSurface = boundaryHasAny(["profile", "member", "account", "settings"]);
     const isCommentSurface = boundaryHasAny(["comment", "reply", "#comment", "comments"]);
@@ -381,14 +409,9 @@ export function classifyEarlyTerminalOutcome(args) {
             confidence: 0.98,
             supportingSignals: ["captcha_terms"],
             evidenceSufficiency: "sufficient",
-            recommendedBusinessOutcome: "blocked_policy",
-            allowRerun: false,
-            outcome: {
-                next_status: "WAITING_POLICY_DECISION",
-                detail: "Submission hit CAPTCHA or managed bot verification and was classified as a terminal audit state.",
-                wait: inferTerminalAuditWait("CAPTCHA_BLOCKED", args.evidenceRef, "CAPTCHA and managed anti-bot gates are not resumed automatically."),
-                terminal_class: "captcha_blocked",
-            },
+            recommendedBusinessOutcome: "unknown_needs_review",
+            allowRerun: true,
+            outcome: buildCaptchaSolverContinuationOutcome(args.evidenceRef),
         });
     }
     if (looksLikeReciprocalRequirement(args.bodyText)) {
@@ -1196,14 +1219,86 @@ function buildRetryableOutcome(args) {
         terminal_class: "outcome_not_confirmed",
     };
 }
-function chooseFinalOutcome(args) {
-    if (!args.proposed) {
+const VALID_TASK_STATUSES = new Set([
+    "READY",
+    "RUNNING",
+    "WAITING_EXTERNAL_EVENT",
+    "WAITING_POLICY_DECISION",
+    "WAITING_MISSING_INPUT",
+    "WAITING_MANUAL_AUTH",
+    "WAITING_RETRY_DECISION",
+    "WAITING_SITE_RESPONSE",
+    "RETRYABLE",
+    "DONE",
+    "SKIPPED",
+]);
+function isTaskStatus(value) {
+    return typeof value === "string" && VALID_TASK_STATUSES.has(value);
+}
+function normalizeProposedOutcome(proposed) {
+    if (!proposed || typeof proposed !== "object") {
+        return undefined;
+    }
+    const raw = proposed;
+    const nextStatus = isTaskStatus(raw.next_status)
+        ? raw.next_status
+        : isTaskStatus(raw.status)
+            ? raw.status
+            : undefined;
+    if (!nextStatus) {
+        return undefined;
+    }
+    return {
+        ...raw,
+        next_status: nextStatus,
+        detail: typeof raw.detail === "string" && raw.detail.trim() ? raw.detail : `Operator proposed ${nextStatus}.`,
+    };
+}
+function proposedPolicyIsOnlyContentRelevanceBlocker(args) {
+    if (args.proposed.next_status !== "WAITING_POLICY_DECISION") {
+        return false;
+    }
+    if (args.flowFamily !== "forum_post" && args.flowFamily !== "wp_comment") {
+        return false;
+    }
+    const policyText = [
+        args.proposed.detail,
+        args.proposed.wait?.wait_reason_code,
+        args.proposed.wait?.resume_trigger,
+        args.proposed.skip_reason_code,
+    ]
+        .filter((value) => Boolean(value))
+        .join("\n")
+        .toLowerCase();
+    return [
+        /\boff[-\s]?topic\b/,
+        /\btopically\s+(?:different|unrelated|irrelevant)\b/,
+        /\b(?:low|poor|weak)\s+(?:content\s+)?relevance\b/,
+        /\bcontent\s+relevance\b/,
+        /\birrelevant\b/,
+        /\bunrelated\b/,
+        /\badvertis(?:e|ing|ement|ements)?\b/,
+        /\bpromot(?:e|ion|ional|ions)\b/,
+        /\bself[-\s]?promot(?:e|ion|ional)?\b/,
+        /\bcommercial\s+(?:link|links|backlink|backlinks|post|posts)\b/,
+        /\bbacklink(?:s)?\b/,
+        /\blink\s+(?:drop|dropping|placement|building)\b/,
+        /\banti[-\s]?spam\b/,
+        /\bspam(?:my)?\b/,
+    ].some((pattern) => pattern.test(policyText));
+}
+export function chooseFinalOutcome(args) {
+    const proposed = normalizeProposedOutcome(args.proposed);
+    if (!proposed) {
         return args.inferred;
     }
-    if (args.proposed.next_status === "RETRYABLE" && args.inferred.next_status !== "RETRYABLE") {
+    if (proposed.next_status === "RETRYABLE" && args.inferred.next_status !== "RETRYABLE") {
         return args.inferred;
     }
-    return args.proposed;
+    if (proposedPolicyIsOnlyContentRelevanceBlocker({ proposed, flowFamily: args.flowFamily })) {
+        return args.inferred;
+    }
+    return proposed;
 }
 const VISUAL_FALLBACK_SUCCESS_STATUSES = new Set([
     "WAITING_SITE_RESPONSE",
@@ -1288,7 +1383,7 @@ export function mustRunVisualGateBeforeClosure(args) {
 }
 export function applyVisualVerificationGuard(args) {
     const visual = args.visualVerification;
-    if (!visual || visual.confidence < 0.55) {
+    if (!visual || typeof visual.confidence !== "number" || !Number.isFinite(visual.confidence) || visual.confidence < 0.55) {
         return args.outcome;
     }
     const visualDetail = describeVisualVerification(visual);
@@ -1297,10 +1392,7 @@ export function applyVisualVerificationGuard(args) {
             return buildSiteResponseOutcome(args.evidenceRef, visualDetail);
         }
         if (visual.classification === "captcha_or_human_verification") {
-            return {
-                ...buildCaptchaSkipOutcome(args.evidenceRef),
-                detail: visualDetail,
-            };
+            return buildCaptchaSolverContinuationOutcome(args.evidenceRef, visualDetail);
         }
         if (visual.classification === "login_gate") {
             return buildManualAuthOutcome(args.evidenceRef, visualDetail);
@@ -1310,10 +1402,7 @@ export function applyVisualVerificationGuard(args) {
         return buildSiteResponseOutcome(args.evidenceRef, visualDetail);
     }
     if (args.outcome.next_status === "WAITING_MANUAL_AUTH" && visual.classification === "captcha_or_human_verification") {
-        return {
-            ...buildCaptchaSkipOutcome(args.evidenceRef),
-            detail: visualDetail,
-        };
+        return buildCaptchaSolverContinuationOutcome(args.evidenceRef, visualDetail);
     }
     if (args.outcome.next_status === "WAITING_MANUAL_AUTH" && visual.classification !== "login_gate") {
         const waitReasonCode = visual.classification === "404_or_stale_submit_path"
@@ -1501,12 +1590,58 @@ function buildOperatorOnlyLoopDisabledError() {
         "claim-next-task -> task-prepare -> operator skill/browser-use -> task-record-agent-trace -> task-finalize.",
     ].join(" "));
 }
+function isNavigableHttpUrl(value) {
+    if (!value) {
+        return false;
+    }
+    try {
+        const protocol = new URL(value).protocol;
+        return protocol === "http:" || protocol === "https:";
+    }
+    catch {
+        return false;
+    }
+}
+export function resolveFinalizationPreferredUrl(args) {
+    const handoffUrl = args.handoffCurrentUrl?.trim();
+    return handoffUrl && isNavigableHttpUrl(handoffUrl) ? handoffUrl : args.taskTargetUrl;
+}
+export function shouldRebindFinalizationPageContext(args) {
+    if (!isNavigableHttpUrl(args.preferredUrl)) {
+        return false;
+    }
+    const expectedHostname = normalizeComparableHostname(args.preferredUrl) ?? normalizeComparableHostname(args.taskHostname) ?? args.taskHostname;
+    const actualHostname = normalizeComparableHostname(args.currentUrl);
+    return actualHostname !== expectedHostname;
+}
+async function rebindFinalizationPageContextIfNeeded(args) {
+    if (!shouldRebindFinalizationPageContext({
+        currentUrl: args.page.url(),
+        preferredUrl: args.preferredUrl,
+        taskHostname: args.taskHostname,
+    })) {
+        return;
+    }
+    await args.page
+        .goto(args.preferredUrl, { waitUntil: "domcontentloaded", timeout: 20_000 })
+        .catch(() => undefined);
+    await args.page.waitForLoadState("domcontentloaded", { timeout: 2_000 }).catch(() => undefined);
+}
 export async function runAgentDrivenBrowserUseLoop(_args) {
     throw buildOperatorOnlyLoopDisabledError();
 }
 export async function runTakeoverFinalization(args) {
     try {
+        const preferredFinalizationUrl = resolveFinalizationPreferredUrl({
+            handoffCurrentUrl: args.handoff.current_url,
+            taskTargetUrl: args.task.target_url,
+        });
         return await withConnectedPage(args.runtime.cdp_url, async (page) => {
+            await rebindFinalizationPageContextIfNeeded({
+                page,
+                preferredUrl: preferredFinalizationUrl,
+                taskHostname: args.task.hostname,
+            });
             const artifactPath = getArtifactFilePath(args.task.id, "finalization");
             const screenshotPath = path.join(DATA_DIRECTORIES.artifacts, `${args.task.id}-finalization.png`);
             let pageState = await captureFinalizationPageState({
@@ -1629,6 +1764,7 @@ export async function runTakeoverFinalization(args) {
             const baselineOutcome = chooseFinalOutcome({
                 inferred: inferredOutcome,
                 proposed: args.handoff.proposed_outcome,
+                flowFamily: args.task.flow_family,
             });
             const visualGateRequired = mustRunVisualGateBeforeClosure({
                 outcome: baselineOutcome,
@@ -1714,7 +1850,7 @@ export async function runTakeoverFinalization(args) {
                 link_verification: linkVerification,
             };
         }, {
-            preferredUrl: args.handoff.current_url,
+            preferredUrl: preferredFinalizationUrl,
             operationTimeoutMs: 45_000,
             pageCloseTimeoutMs: 2_000,
             browserCloseTimeoutMs: 2_000,

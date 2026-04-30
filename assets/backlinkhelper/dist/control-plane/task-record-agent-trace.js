@@ -20,7 +20,8 @@ export async function recordAgentTrace(args) {
     if (!task.latest_artifacts.includes(tracePath)) {
         task.latest_artifacts.push(tracePath);
     }
-    task.notes.push(`Recorded Codex-driven agent trace with ${args.envelope.trace.steps.length} step(s).`);
+    const agentBackend = args.envelope.trace.agent_backend || args.envelope.handoff.agent_backend || "unknown-agent";
+    task.notes.push(`Recorded ${agentBackend} agent trace with ${args.envelope.trace.steps.length} step(s).`);
     markTaskStageTimestamp(task, "trace_recorded_at");
     task.last_takeover_outcome = args.envelope.handoff.detail;
     updateTaskExecutionStateFromTrace({

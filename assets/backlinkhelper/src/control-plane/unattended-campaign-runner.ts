@@ -248,14 +248,81 @@ function parseJsonObjectFromStdout(stdout: string): unknown {
   return JSON.parse(trimmed) as unknown;
 }
 
-function runShellOperatorCommand(args: {
+function splitCommandLine(command: string): string[] {
+  const parts: string[] = [];
+  let current = "";
+  let quote: '"' | "'" | undefined;
+  let escaping = false;
+
+  for (const char of command.trim()) {
+    if (escaping) {
+      current += char;
+      escaping = false;
+      continue;
+    }
+    if (char === "\\" && quote !== "'") {
+      escaping = true;
+      continue;
+    }
+    if ((char === '"' || char === "'") && !quote) {
+      quote = char;
+      continue;
+    }
+    if (char === quote) {
+      quote = undefined;
+      continue;
+    }
+    if (!quote && /\s/.test(char)) {
+      if (current) {
+        parts.push(current);
+        current = "";
+      }
+      continue;
+    }
+    current += char;
+  }
+
+  if (escaping) {
+    current += "\\";
+  }
+  if (quote) {
+    throw new Error(`Operator command has an unterminated ${quote} quote.`);
+  }
+  if (current) {
+    parts.push(current);
+  }
+  if (parts.length === 0) {
+    throw new Error("Operator command is empty.");
+  }
+  return parts;
+}
+
+function terminateProcessTree(pid: number | undefined, signal: NodeJS.Signals): void {
+  if (!pid) {
+    return;
+  }
+  try {
+    if (process.platform === "win32") {
+      process.kill(pid, signal);
+    } else {
+      process.kill(-pid, signal);
+    }
+  } catch {
+    // The process may already have exited between timeout and cleanup.
+  }
+}
+
+export function runOperatorCommand(args: {
   command: string;
   context: OperatorContext;
   timeoutMs: number;
+  killGraceMs?: number;
 }): Promise<AgentTraceEnvelope> {
   return new Promise((resolve, reject) => {
-    const child = spawn(args.command, {
-      shell: true,
+    const [executable, ...commandArgs] = splitCommandLine(args.command);
+    const child = spawn(executable, commandArgs, {
+      shell: false,
+      detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
       env: {
         ...process.env,
@@ -269,12 +336,25 @@ function runShellOperatorCommand(args: {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timedOut = false;
+    let killTimer: NodeJS.Timeout | undefined;
+    const clearTimers = () => {
+      clearTimeout(timer);
+      if (killTimer) {
+        clearTimeout(killTimer);
+      }
+    };
     const timer = setTimeout(() => {
       if (settled) {
         return;
       }
+      timedOut = true;
       settled = true;
-      child.kill("SIGTERM");
+      terminateProcessTree(child.pid, "SIGTERM");
+      killTimer = setTimeout(() => {
+        terminateProcessTree(child.pid, "SIGKILL");
+        killTimer = undefined;
+      }, args.killGraceMs ?? 5_000);
       reject(new Error(`Operator command timed out after ${args.timeoutMs}ms.`));
     }, args.timeoutMs);
 
@@ -291,15 +371,18 @@ function runShellOperatorCommand(args: {
         return;
       }
       settled = true;
-      clearTimeout(timer);
+      clearTimers();
       reject(error);
     });
     child.on("close", (code) => {
       if (settled) {
+        if (!timedOut) {
+          clearTimers();
+        }
         return;
       }
       settled = true;
-      clearTimeout(timer);
+      clearTimers();
       if (code !== 0) {
         reject(new Error(`Operator command exited with code ${code ?? "unknown"}: ${stderr.trim()}`));
         return;
@@ -323,7 +406,7 @@ function buildDeps(args: UnattendedCampaignArgs, deps: UnattendedCampaignDeps): 
     deps.runOperator ??
     (operatorCommand
       ? (context: OperatorContext) =>
-          runShellOperatorCommand({
+          runOperatorCommand({
             command: operatorCommand,
             context,
             timeoutMs: args.operatorTimeoutMs ?? 30 * 60 * 1_000,
@@ -472,12 +555,15 @@ export async function runUnattendedCampaign(
       break;
     }
 
-    activeTasksStarted += 1;
     const taskId = scopeResult.task.id;
     const prepare = await effectiveDeps.prepareTask({ taskId, cdpUrl: args.cdpUrl });
     events.push({ phase: "task_prepare", mode: prepare.mode, task_id: taskId });
 
     if (prepare.mode !== "ready_for_agent_loop") {
+      // A prepare-stage stop (for example RETRYABLE cooldown or a terminal audit
+      // boundary) did not start an active operator run. Do not spend the
+      // maxActiveTasks budget on it; keep pulling the next scoped candidate until
+      // an operator actually starts or maxScopeTicks is exhausted.
       stopReason = "prepare_stopped";
       const followUp = await maybeRunFollowUp({
         campaignArgs: args,
@@ -488,12 +574,10 @@ export async function runUnattendedCampaign(
         maxFollowUpTicks,
       });
       followUpTicks = followUp.followUpTicks;
-      if (activeTasksStarted >= maxActiveTasks) {
-        stopReason = "max_active_tasks";
-      }
       continue;
     }
 
+    activeTasksStarted += 1;
     const envelope = await effectiveDeps.runOperator({
       task: prepare.task,
       prepare,

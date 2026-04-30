@@ -6,7 +6,7 @@ export interface TargetSiteRecord {
   hostname: string;
   source: string;
   flow_family_hint?: TaskRecord["flow_family"];
-  submit_status: "candidate" | "enqueued" | "submitted" | "failed" | "skipped";
+  submit_status: "candidate" | "needs_classification" | "enqueued" | "submitted" | "failed" | "skipped";
   imported_at: string;
   last_task_id?: string;
   payload?: Record<string, unknown>;
@@ -48,6 +48,16 @@ function parsePayload<T>(value: unknown): T {
     throw new Error("Expected SQL payload_json column to be a string.");
   }
   return JSON.parse(value) as T;
+}
+
+function isCompleteTargetSitePayload(payload: Partial<TargetSiteRecord> | Record<string, unknown>): payload is TargetSiteRecord {
+  return (
+    typeof payload.target_url === "string" &&
+    typeof payload.hostname === "string" &&
+    typeof payload.source === "string" &&
+    typeof payload.submit_status === "string" &&
+    typeof payload.imported_at === "string"
+  );
 }
 
 function maybeNumber(value: unknown): number | undefined {
@@ -255,10 +265,37 @@ export class SqlDataStore implements DataStoreBackend {
 
   async listTargetSites(limit = 100): Promise<TargetSiteRecord[]> {
     await this.ensureDataDirectories();
-    const rows = await this.executor.all<{ payload_json: string }>(
-      "SELECT payload_json FROM target_sites ORDER BY imported_at ASC, target_url ASC LIMIT ?",
+    const rows = await this.executor.all<{
+      target_url: string;
+      hostname: string;
+      source: string;
+      flow_family_hint: TaskRecord["flow_family"] | null;
+      submit_status: TargetSiteRecord["submit_status"];
+      imported_at: string;
+      last_task_id: string | null;
+      payload_json: string;
+    }>(
+      `SELECT target_url, hostname, source, flow_family_hint, submit_status, imported_at, last_task_id, payload_json
+       FROM target_sites
+       ORDER BY imported_at ASC, target_url ASC
+       LIMIT ?`,
       [limit],
     );
-    return rows.map((row) => parsePayload<TargetSiteRecord>(row.payload_json));
+    return rows.map((row) => {
+      const payload = parsePayload<Partial<TargetSiteRecord> | Record<string, unknown>>(row.payload_json);
+      if (isCompleteTargetSitePayload(payload)) {
+        return payload;
+      }
+      return {
+        target_url: row.target_url,
+        hostname: row.hostname,
+        source: row.source,
+        flow_family_hint: row.flow_family_hint ?? undefined,
+        submit_status: row.submit_status,
+        imported_at: row.imported_at,
+        last_task_id: row.last_task_id ?? undefined,
+        payload,
+      } satisfies TargetSiteRecord;
+    });
   }
 }

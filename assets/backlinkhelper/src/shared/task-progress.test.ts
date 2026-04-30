@@ -295,6 +295,35 @@ test("outcome update stores blocker metadata and preserves retry budget for visu
   assert.ok(task.execution_state?.evidence.some((item) => item.signal === "visual_verification_required"));
 });
 
+test("outcome update stores CAPTCHA solver waits as non-budget external blockers", () => {
+  const task = makeTask();
+  const wait: WaitMetadata = {
+    wait_reason_code: "CAPTCHA_SOLVER_CONTINUATION",
+    resume_trigger: "CAPTCHA solver should continue from the current challenge state.",
+    resolution_owner: "system",
+    resolution_mode: "auto_resume",
+    evidence_ref: "/tmp/finalization.json",
+  };
+
+  updateTaskExecutionStateFromOutcome({
+    task,
+    nextStatus: "WAITING_EXTERNAL_EVENT",
+    detail: "CAPTCHA solver should continue from the current challenge state.",
+    wait,
+    terminalClass: "captcha_blocked",
+    currentUrl: "https://directory.example.com/submit",
+    currentTitle: "Human verification",
+    artifactRefs: ["/tmp/finalization.json"],
+    source: "finalize",
+  });
+
+  assert.equal(task.execution_state?.blockers[0]?.blocker_type, "captcha_solver_continuation");
+  assert.equal(task.execution_state?.blockers[0]?.can_auto_resume, true);
+  assert.equal(task.execution_state?.blockers[0]?.consumes_retry_budget, false);
+  assert.equal(task.execution_state?.frontier?.context_type, "captcha_surface");
+  assert.ok(task.execution_state?.evidence.some((item) => item.signal === "captcha_solver_continuation"));
+});
+
 test("outcome update stores link verification evidence for multi-family tasks", () => {
   const task = makeTask({
     flow_family: "forum_profile",

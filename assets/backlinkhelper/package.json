@@ -30,7 +30,8 @@
     "diff-skills": "node scripts/diff-skills.mjs"
   },
   "dependencies": {
-    "playwright": "^1.54.2"
+    "playwright": "^1.54.2",
+    "tldts": "^7.0.28"
   },
   "devDependencies": {
     "@types/node": "^24.0.13",

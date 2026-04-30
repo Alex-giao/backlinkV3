@@ -11,6 +11,9 @@ importers:
       playwright:
         specifier: ^1.54.2
         version: 1.59.0
+      tldts:
+        specifier: ^7.0.28
+        version: 7.0.28
     devDependencies:
       '@types/node':
         specifier: ^24.0.13
@@ -39,6 +42,13 @@ packages:
     engines: {node: '>=18'}
     hasBin: true
 
+  tldts-core@7.0.28:
+    resolution: {integrity: sha512-7W5Efjhsc3chVdFhqtaU0KtK32J37Zcr9RKtID54nG+tIpcY79CQK/veYPODxtD/LJ4Lue66jvrQzIX2Z2/pUQ==}
+
+  tldts@7.0.28:
+    resolution: {integrity: sha512-+Zg3vWhRUv8B1maGSTFdev9mjoo8Etn2Ayfs4cnjlD3CsGkxXX4QyW3j2WJ0wdjYcYmy7Lx2RDsZMhgCWafKIw==}
+    hasBin: true
+
   typescript@5.9.3:
     resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
     engines: {node: '>=14.17'}
@@ -63,6 +73,12 @@ snapshots:
       playwright-core: 1.59.0
     optionalDependencies:
       fsevents: 2.3.2
+
+  tldts-core@7.0.28: {}
+
+  tldts@7.0.28:
+    dependencies:
+      tldts-core: 7.0.28
 
   typescript@5.9.3: {}
 

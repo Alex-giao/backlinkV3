@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildHomepageProbeUrl, classifyScoutTerminalBoundary, inferOpportunityClassFromScout, mustRunHomepageRecoveryBeforeRetry, reclassifyTaskFlowFamilyForPrepare, shouldProbeHomepageForSubmitRecovery, } from "./task-prepare.js";
+import { buildHomepageProbeUrl, classifyScoutTerminalBoundary, inferOpportunityClassFromScout, mustRunHomepageRecoveryBeforeRetry, reclassifyTaskFlowFamilyForPrepare, reclassifyTaskFlowFamilyFromScout, shouldProbeHomepageForSubmitRecovery, } from "./task-prepare.js";
 function makeTask(overrides = {}) {
     return {
         id: "task-prepare-test",
@@ -84,6 +84,40 @@ test("task-prepare infers forum thread targets without synthetic corrected-from 
     assert.equal(task.flow_family, "forum_post");
     assert.equal(task.flow_family_source, "inferred");
     assert.equal(task.corrected_from_family, undefined);
+});
+test("task-prepare corrects Blogger comment frames to wp_comment after scout", () => {
+    const task = makeTask({
+        target_url: "http://staffpicks.yourlibrary.ca/2020/09/sunny-days.html",
+        hostname: "staffpicks.yourlibrary.ca",
+        flow_family: "saas_directory",
+        flow_family_source: "defaulted",
+    });
+    const scout = makeScout({
+        surface_summary: "Scout reached a Blogger article.",
+        embed_hints: [
+            {
+                frame_index: 1,
+                provider: "unknown",
+                frame_url: "https://www.blogger.com/comment/frame/8348134481638572242?po=6409126616709870746&jsh=m%3B%2F_%2Fscs%2Fabc-static",
+                body_text_excerpt: "Enter comment",
+                cta_candidates: [],
+                submit_candidates: [],
+                likely_interactive: false,
+            },
+        ],
+        page_snapshot: {
+            url: "http://staffpicks.yourlibrary.ca/2020/09/sunny-days.html",
+            title: "RPL Staff Picks: Sunny Days",
+            response_status: 200,
+            body_text_excerpt: "Blog article",
+        },
+    });
+    const changed = reclassifyTaskFlowFamilyFromScout(task, scout, "unit-test scout");
+    assert.equal(changed, true);
+    assert.equal(task.flow_family, "wp_comment");
+    assert.equal(task.flow_family_source, "corrected");
+    assert.equal(task.corrected_from_family, "saas_directory");
+    assert.match(task.flow_family_reason ?? "", /Blogger comment frame/i);
 });
 test("buildHomepageProbeUrl normalizes stale submit URLs to homepage", () => {
     assert.equal(buildHomepageProbeUrl("https://example.com/submit/#"), "https://example.com/");
@@ -276,6 +310,101 @@ test("scout terminal classifier front-loads existing-account login walls", () =>
     });
     assert.equal(classification?.outcome.next_status, "WAITING_MANUAL_AUTH");
     assert.equal(classification?.outcome.wait?.wait_reason_code, "DIRECTORY_LOGIN_REQUIRED");
+});
+test("scout terminal classifier keeps forum post submit/auth ambiguity out of manual-auth", () => {
+    const task = makeTask({
+        flow_family: "forum_post",
+        target_url: "https://forums.example.com/hc/en-us/community/posts/123-feature-request",
+        hostname: "forums.example.com",
+    });
+    const scout = makeScout({
+        surface_summary: "Forum community post is reachable and exposes a new-post path.",
+        submit_candidates: ["New post", "Post your idea here!", "Follow"],
+        auth_hints: ["sign in"],
+        field_hints: ["topic"],
+        page_snapshot: {
+            url: "https://forums.example.com/hc/en-us/community/posts/123-feature-request",
+            title: "Feature request",
+            response_status: 200,
+            body_text_excerpt: "Have a feature request? Post your idea here! New post. Please sign in to leave a comment.",
+        },
+        page_assessment: {
+            page_reachable: true,
+            visual_verification_required: true,
+            classification_confidence: "low",
+            ambiguity_flags: ["mixed_submit_and_auth_signals"],
+        },
+    });
+    const classification = classifyScoutTerminalBoundary({
+        task,
+        scout,
+        evidenceRef: "artifact.json",
+    });
+    assert.equal(classification, undefined);
+});
+test("scout terminal classifier keeps visible Google OAuth routes out of manual-auth", () => {
+    const task = makeTask();
+    const scout = makeScout({
+        surface_summary: "OAuth login option is visible before submission.",
+        submit_candidates: [],
+        auth_hints: ["log in", "with Google"],
+        page_snapshot: {
+            url: "https://directory.example.com/sign-in",
+            title: "Sign in",
+            response_status: 200,
+            body_text_excerpt: "Welcome back. Log in with Google to continue submitting your tool.",
+        },
+        page_assessment: {
+            page_reachable: true,
+            visual_verification_required: false,
+            classification_confidence: "medium",
+            ambiguity_flags: [],
+        },
+    });
+    const classification = classifyScoutTerminalBoundary({
+        task,
+        scout,
+        evidenceRef: "artifact.json",
+    });
+    assert.equal(classification, undefined);
+});
+test("scout terminal classifier ignores encoded Blogger iframe URL fragments when the comment frame is open", () => {
+    const task = makeTask({ flow_family: "saas_directory" });
+    const scout = makeScout({
+        surface_summary: "Blogger article with an open comment frame.",
+        submit_candidates: ["Search"],
+        field_hints: ["website", "email"],
+        auth_hints: [],
+        embed_hints: [
+            {
+                frame_index: 1,
+                provider: "unknown",
+                frame_url: "https://www.blogger.com/comment/frame/8348134481638572242?jsh=m%3B%2F_%2Fscs%2Fabc-static",
+                body_text_excerpt: "Enter comment",
+                cta_candidates: [],
+                submit_candidates: [],
+                likely_interactive: false,
+            },
+        ],
+        page_snapshot: {
+            url: "http://staffpicks.yourlibrary.ca/2020/09/sunny-days.html",
+            title: "RPL Staff Picks: Sunny Days",
+            response_status: 200,
+            body_text_excerpt: "Blog article",
+        },
+        page_assessment: {
+            page_reachable: true,
+            visual_verification_required: true,
+            classification_confidence: "medium",
+            ambiguity_flags: [],
+        },
+    });
+    const classification = classifyScoutTerminalBoundary({
+        task,
+        scout,
+        evidenceRef: "artifact.json",
+    });
+    assert.equal(classification, undefined);
 });
 test("scout terminal classifier lets solver-supported reCAPTCHA continue to operator", () => {
     const previousKey = process.env.CAPSOLVER_API_KEY;

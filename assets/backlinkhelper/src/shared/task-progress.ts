@@ -138,6 +138,10 @@ function inferContextType(args: {
     return "confirmation_surface";
   }
 
+  if (args.terminalClass === "captcha_blocked" || args.visual?.classification === "captcha_or_human_verification") {
+    return "captcha_surface";
+  }
+
   if (
     args.taskStatus === "WAITING_SITE_RESPONSE" ||
     args.taskStatus === "WAITING_EXTERNAL_EVENT" ||
@@ -164,10 +168,6 @@ function inferContextType(args: {
 
   if (args.taskStatus === "SKIPPED") {
     return "terminal_surface";
-  }
-
-  if (args.terminalClass === "captcha_blocked" || args.visual?.classification === "captcha_or_human_verification") {
-    return "captcha_surface";
   }
 
   if (
@@ -221,6 +221,9 @@ function inferNextBestActions(args: {
   }
   if (args.wait?.wait_reason_code === "VISUAL_VERIFICATION_REQUIRED") {
     actions.push("capture_terminal_evidence");
+  }
+  if (args.wait?.wait_reason_code === "CAPTCHA_SOLVER_CONTINUATION") {
+    actions.push("continue_captcha_solver");
   }
   if (args.wait?.wait_reason_code === "REQUIRED_INPUT_MISSING") {
     actions.push("resume_after_missing_input");
@@ -442,6 +445,17 @@ function inferBlockersFromOutcome(args: {
       buildBlocker("visual_verification_required", {
         severity: "soft",
         unblockRequirement: "capture_terminal_evidence",
+        canAutoResume: true,
+        consumesRetryBudget: false,
+      }),
+    ];
+  }
+
+  if (reason === "CAPTCHA_SOLVER_CONTINUATION") {
+    return [
+      buildBlocker("captcha_solver_continuation", {
+        severity: "soft",
+        unblockRequirement: "continue_captcha_solver",
         canAutoResume: true,
         consumesRetryBudget: false,
       }),

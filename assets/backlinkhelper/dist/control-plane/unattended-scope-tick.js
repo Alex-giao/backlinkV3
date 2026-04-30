@@ -1,6 +1,7 @@
 import { enqueueSiteTask } from "./task-queue.js";
 import { canRetry, claimNextTask, matchesTaskScope, pickNextTaskForLane, resolveWorkerLeaseGroupForLane, } from "./task-queue.js";
 import { buildTargetPreflightAssessment } from "./target-preflight.js";
+import { classifyTargetSurfaceForIntake } from "../families/classifier.js";
 import { loadBrowserOwnership } from "../execution/ownership-lock.js";
 import { ensureDataDirectories, listTargetSites, listTasks, loadWorkerLease, upsertTargetSite, } from "../memory/data-store.js";
 import { loadRuntimeIncident } from "../shared/runtime-incident.js";
@@ -63,43 +64,84 @@ function buildTaskId(args) {
     const hostname = new URL(args.targetUrl).hostname.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
     return `${args.prefix ?? "unattended"}-${String(args.index).padStart(4, "0")}-${hostname}`.slice(0, 120);
 }
+function classifyCandidateSurface(args) {
+    return classifyTargetSurfaceForIntake({
+        targetUrl: args.site.target_url,
+        requestedFlowFamily: requestedFlowFamilyForCandidate(args),
+    });
+}
+function requestedFlowFamilyForCandidate(args) {
+    if (args.flowFamily) {
+        return args.flowFamily;
+    }
+    // Older CSV imports may have stored an inferred family in flow_family_hint.
+    // Treat the payload provenance as authoritative so later intake does not
+    // convert inferred URL evidence into an explicit operator hint.
+    return args.site.payload?.flow_family_source === "inferred" ? undefined : args.site.flow_family_hint;
+}
 function previewCandidate(args) {
-    const flowFamily = args.flowFamily ?? args.site.flow_family_hint;
     const assessment = buildTargetPreflightAssessment({
         targetUrl: args.site.target_url,
         promotedHostname: args.promotedHostname,
-        flowFamily,
+        flowFamily: args.surface.flowFamily,
         historicalTasks: args.historicalTasks,
     });
     return {
         target_url: args.site.target_url,
         hostname: args.site.hostname,
         source: args.site.source,
-        flow_family_hint: flowFamily,
+        flow_family_hint: args.surface.flowFamily,
         queue_priority_score: assessment.queue_priority_score,
         viability: assessment.viability,
     };
 }
-function pickSafeCandidate(args) {
-    const representedTargetHosts = new Set(args.historicalTasks
+function representedTargetHostsForScope(args) {
+    return new Set(args.historicalTasks
         .filter((task) => normalizeHostname(task.submission.promoted_profile.hostname) === args.promotedHostname)
         .map((task) => normalizeHostname(task.hostname))
         .filter((hostname) => Boolean(hostname)));
+}
+function baseCandidateRows(args) {
+    const representedTargetHosts = representedTargetHostsForScope({
+        historicalTasks: args.historicalTasks,
+        promotedHostname: args.promotedHostname,
+    });
     return args.candidates
         .map((site, index) => ({ site, index }))
         .filter(({ site }) => site.submit_status === "candidate")
         .filter(({ site }) => !isSmokeTargetSite(site))
         .filter(({ site }) => isHttpTargetSite(site))
         .filter(({ site }) => normalizeHostname(site.hostname) !== args.promotedHostname)
-        .filter(({ site }) => !representedTargetHosts.has(normalizeHostname(site.hostname) ?? ""))
+        .filter(({ site }) => !representedTargetHosts.has(normalizeHostname(site.hostname) ?? ""));
+}
+function pickNeedsClassificationCandidate(args) {
+    return baseCandidateRows(args)
         .map(({ site, index }) => ({
         site,
         index,
+        surface: classifyCandidateSurface({ site, flowFamily: args.flowFamily }),
+    }))
+        .filter(({ surface }) => surface.state === "needs_classification")
+        .sort((left, right) => left.site.imported_at.localeCompare(right.site.imported_at) ||
+        left.site.target_url.localeCompare(right.site.target_url))[0];
+}
+function pickSafeCandidate(args) {
+    return baseCandidateRows(args)
+        .map(({ site, index }) => ({
+        site,
+        index,
+        surface: classifyCandidateSurface({ site, flowFamily: args.flowFamily }),
+    }))
+        .filter(({ surface }) => surface.state === "ready")
+        .map(({ site, index, surface }) => ({
+        site,
+        index,
+        surface,
         preview: previewCandidate({
             site,
             promotedHostname: args.promotedHostname,
             historicalTasks: args.historicalTasks,
-            flowFamily: args.flowFamily,
+            surface,
         }),
     }))
         .filter(({ preview }) => preview.viability !== "deprioritized")
@@ -189,8 +231,32 @@ async function previewDryRun(args, scope) {
         promotedHostname,
         flowFamily: args.flowFamily,
     });
-    const safeCandidateCount = countSafeCandidates(candidatePool, tasks, promotedHostname);
+    const safeCandidateCount = countSafeCandidates({
+        candidatePool,
+        tasks,
+        promotedHostname,
+        flowFamily: args.flowFamily,
+    });
+    const needsClassificationCandidate = pickNeedsClassificationCandidate({
+        candidates: candidatePool,
+        historicalTasks: tasks,
+        promotedHostname,
+        flowFamily: args.flowFamily,
+    });
     if (!safeCandidate) {
+        if (needsClassificationCandidate && !coolingDown) {
+            return {
+                action: "needs_classification",
+                scope,
+                detail: `Dry run: ${buildNeedsClassificationDetail(needsClassificationCandidate)}`,
+                dry_run: true,
+                counts: {
+                    scoped_tasks: scopedTasks.length,
+                    candidate_pool: candidatePool.length,
+                    safe_candidates: safeCandidateCount,
+                },
+            };
+        }
         return {
             action: hasLiveManualBoundary(scopedTasks) ? "needs_manual_boundary" : "no_candidate",
             scope,
@@ -216,17 +282,26 @@ async function previewDryRun(args, scope) {
         },
     };
 }
-function countSafeCandidates(candidatePool, tasks, promotedHostname) {
-    return candidatePool.filter((site) => {
-        if (site.submit_status !== "candidate" || isSmokeTargetSite(site) || !isHttpTargetSite(site)) {
-            return false;
-        }
-        if (normalizeHostname(site.hostname) === promotedHostname) {
-            return false;
-        }
-        return !tasks.some((task) => normalizeHostname(task.submission.promoted_profile.hostname) === promotedHostname &&
-            normalizeHostname(task.hostname) === normalizeHostname(site.hostname));
-    }).length;
+function countSafeCandidates(args) {
+    return baseCandidateRows({
+        candidates: args.candidatePool,
+        historicalTasks: args.tasks,
+        promotedHostname: args.promotedHostname,
+    })
+        .map(({ site }) => ({
+        site,
+        surface: classifyCandidateSurface({ site, flowFamily: args.flowFamily }),
+    }))
+        .filter(({ surface }) => surface.state === "ready")
+        .filter(({ site, surface }) => buildTargetPreflightAssessment({
+        targetUrl: site.target_url,
+        promotedHostname: args.promotedHostname,
+        flowFamily: surface.flowFamily,
+        historicalTasks: args.tasks,
+    }).viability !== "deprioritized").length;
+}
+function buildNeedsClassificationDetail(candidate) {
+    return `Target-site intake paused ${candidate.site.target_url}: ${candidate.surface.reason}`;
 }
 export async function runUnattendedScopeTick(args) {
     await ensureDataDirectories();
@@ -304,8 +379,46 @@ export async function runUnattendedScopeTick(args) {
         promotedHostname,
         flowFamily: args.flowFamily,
     });
-    const safeCandidateCount = countSafeCandidates(candidatePool, tasks, promotedHostname);
+    const safeCandidateCount = countSafeCandidates({
+        candidatePool,
+        tasks,
+        promotedHostname,
+        flowFamily: args.flowFamily,
+    });
+    const needsClassificationCandidate = pickNeedsClassificationCandidate({
+        candidates: candidatePool,
+        historicalTasks: tasks,
+        promotedHostname,
+        flowFamily: args.flowFamily,
+    });
     if (!safeCandidate) {
+        if (needsClassificationCandidate && !coolingDown) {
+            await upsertTargetSite({
+                ...needsClassificationCandidate.site,
+                submit_status: "needs_classification",
+                flow_family_hint: undefined,
+                payload: {
+                    ...(needsClassificationCandidate.site.payload ?? {}),
+                    surface_diagnosis: {
+                        at: new Date().toISOString(),
+                        state: needsClassificationCandidate.surface.state,
+                        source: needsClassificationCandidate.surface.source,
+                        reason: needsClassificationCandidate.surface.reason,
+                    },
+                },
+            });
+            return {
+                action: "needs_classification",
+                scope,
+                detail: buildNeedsClassificationDetail(needsClassificationCandidate),
+                reapedTaskId: claim.reapedTaskId,
+                counts: {
+                    scoped_tasks: scopedTasks.length,
+                    candidate_pool: candidatePool.length,
+                    safe_candidates: safeCandidateCount,
+                },
+            };
+        }
         if (coolingDown) {
             return {
                 action: "cooldown",
@@ -344,13 +457,14 @@ export async function runUnattendedScopeTick(args) {
         promotedDescription: args.promotedDescription,
         submitterEmailBase: args.submitterEmailBase,
         confirmSubmit: args.confirmSubmit ?? false,
-        flowFamily: args.flowFamily ?? safeCandidate.site.flow_family_hint,
+        flowFamily: requestedFlowFamilyForCandidate({ site: safeCandidate.site, flowFamily: args.flowFamily }),
         enqueuedBy: "unattended-scope-tick",
     });
     const acceptedOutcomes = new Set(["accept_new_task", "reactivated_existing_task", "reused_existing_task"]);
     await upsertTargetSite({
         ...safeCandidate.site,
         submit_status: acceptedOutcomes.has(enqueueResult.outcome) ? "enqueued" : "skipped",
+        flow_family_hint: safeCandidate.surface.flowFamily,
         last_task_id: enqueueResult.task.id,
         payload: {
             ...(safeCandidate.site.payload ?? {}),

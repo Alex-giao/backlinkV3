@@ -92,8 +92,31 @@ export const SUPPORTED_COMMANDS = [
 export function buildUnknownCommandMessage() {
     return `Unknown command. Use ${SUPPORTED_COMMANDS.map((command) => `"${command}"`).join(", ").replace(/, ([^,]+)$/, ", or $1")}.`;
 }
+const SINGLE_TASK_OPERATOR_FORBIDDEN_COMMANDS = new Set([
+    "enqueue-site",
+    "import-backlink-csv",
+    "follow-up-tick",
+    "unattended-campaign",
+    "unattended-scope-tick",
+    "update-promoted-dossier",
+    "claim-next-task",
+    "task-prepare",
+    "task-record-agent-trace",
+    "task-finalize",
+    "run-next",
+    "repartition-retry-decisions",
+]);
+export function assertCommandAllowedInSingleTaskOperatorMode(command, env = process.env) {
+    if (env.BACKLINKHELPER_SINGLE_TASK_OPERATOR_GUARD !== "1" || !command) {
+        return;
+    }
+    if (SINGLE_TASK_OPERATOR_FORBIDDEN_COMMANDS.has(command)) {
+        throw new Error(`Command ${command} is blocked by BACKLINKHELPER_SINGLE_TASK_OPERATOR_GUARD for single-task family operators.`);
+    }
+}
 async function main() {
     const [, , command, ...rest] = process.argv;
+    assertCommandAllowedInSingleTaskOperatorMode(command);
     const cdpUrl = readFlag(rest, "--cdp-url");
     switch (command) {
         case "start-browser":

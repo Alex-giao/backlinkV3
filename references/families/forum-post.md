@@ -1,6 +1,6 @@
 # Forum Post Family Reference
 
-用途：记录 forum / thread / topic / reply 一类“发帖带链接” surface 的经验，供后续 runtime 扩展使用。注意：当前 installed runtime 可能尚未把 `forum_post` 作为正式 `flow_family` 暴露给 CLI，但这类 surface 已经在真实站点里出现，不能再被误判成 `forum_profile`。
+用途：记录 forum / thread / topic / reply 一类“发帖带链接” surface 的经验。当前 runtime 已把 `forum_post` 作为正式 `flow_family` 暴露给 classifier / dispatcher / generic family agent；这类 surface 不能被误判成 `forum_profile` 或默认 `saas_directory`。
 
 关注面：
 - new topic / add topic / add thread / create post / reply composer

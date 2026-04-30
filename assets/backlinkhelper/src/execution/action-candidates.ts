@@ -11,6 +11,7 @@ export interface RawActionCandidate {
   inside_form?: boolean;
   area?: "header" | "main" | "footer" | "unknown";
   same_origin?: boolean;
+  same_site?: boolean;
   same_page?: boolean;
   path?: string;
   top?: number;
@@ -40,31 +41,95 @@ function hasIgnorableHref(candidate: RawActionCandidate): boolean {
     href.startsWith("tel:") ||
     href.startsWith("javascript:") ||
     href === "#" ||
-    href.endsWith("#")
+    href.startsWith("#")
   );
+}
+
+function explicitContinuationKind(candidate: RawActionCandidate): "auth" | "register" | undefined {
+  const path = normalizeWhitespace(candidate.path).toLowerCase();
+  const text = normalizeWhitespace(candidate.text).toLowerCase();
+  const registerPathPattern = /(^|\/)(?:(?:account|accounts|auth|member|members|user|users)\/)?(?:register|registration|sign-up|signup|sign_up|create-account|create_account|join)(?:\/|$|[._-])/i;
+  const authPathPattern = /(^|\/)(?:(?:account|accounts|auth|member|members|user|users)\/)?(?:login|log-in|signin|sign-in|sign_in)(?:\/|$|[._-])/i;
+
+  // Register wins over auth so /auth/register and /users/sign_up do not get
+  // treated as existing-account login walls.
+  if (registerPathPattern.test(path) || /\b(register|sign up|signup|create account|join now)\b/i.test(text)) {
+    return "register";
+  }
+  if (authPathPattern.test(path) || path === "/auth" || path === "/auth/" || /\b(log in|login|sign in|signin)\b/i.test(text)) {
+    return "auth";
+  }
+  return undefined;
+}
+
+function hasHttpsHref(candidate: RawActionCandidate): boolean {
+  const href = normalizeWhitespace(candidate.href);
+  if (!href) {
+    return false;
+  }
+  try {
+    return new URL(href).protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function hasCleartextCredentialHref(candidate: RawActionCandidate): boolean {
+  if (explicitContinuationKind(candidate) === undefined) {
+    return false;
+  }
+  const href = normalizeWhitespace(candidate.href);
+  if (!href || href.startsWith("/") || href.startsWith("#")) {
+    return false;
+  }
+  try {
+    return new URL(href).protocol === "http:";
+  } catch {
+    return /^http:/i.test(href);
+  }
+}
+
+function isAllowedCrossOriginContinuation(candidate: RawActionCandidate): boolean {
+  return candidate.same_site === true && hasHttpsHref(candidate) && explicitContinuationKind(candidate) !== undefined;
 }
 
 function classifyCandidateKind(candidate: RawActionCandidate): ScoutLinkCandidate["kind"] {
   const path = normalizeWhitespace(candidate.path).toLowerCase();
   const top = candidate.top ?? Number.POSITIVE_INFINITY;
+  const relatedSite = candidate.same_origin || candidate.same_site;
 
   if (isSubmitControl(candidate) || candidate.inside_form) {
     return "submit";
   }
 
-  if (candidate.same_origin) {
-    if (/(^|\/)(login|log-in|signin|sign-in|auth)(\/|$)/i.test(path)) {
-      return "auth";
+  if (relatedSite) {
+    const continuationKind = explicitContinuationKind(candidate);
+    if (continuationKind) {
+      return continuationKind;
     }
-    if (/(^|\/)(register|registration|sign-up|signup|create-account)(\/|$)/i.test(path)) {
-      return "register";
-    }
-    if (!candidate.same_page && path && path !== "/" && path !== "/home" && (candidate.area === "header" || top <= 320)) {
+
+    // Generic header/top CTA promotion is intentionally same-origin only.
+    // Sibling-domain links can receive signup credentials later, so they must
+    // carry explicit auth/register intent rather than being ordinary nav links.
+    if (candidate.same_origin && !candidate.same_page && path && path !== "/" && path !== "/home" && (candidate.area === "header" || top <= 320)) {
       return "submit";
     }
   }
 
   return "other";
+}
+
+function candidateKindPriority(kind: ScoutLinkCandidate["kind"]): number {
+  switch (kind) {
+    case "register":
+      return 3;
+    case "auth":
+      return 2;
+    case "submit":
+      return 1;
+    case "other":
+      return 0;
+  }
 }
 
 function scoreCandidate(candidate: RawActionCandidate): number {
@@ -80,7 +145,11 @@ function scoreCandidate(candidate: RawActionCandidate): number {
     return Number.NEGATIVE_INFINITY;
   }
 
-  if (!submitControl && candidate.same_origin === false) {
+  if (!submitControl && hasCleartextCredentialHref(candidate)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  if (!submitControl && candidate.same_origin === false && !isAllowedCrossOriginContinuation(candidate)) {
     return Number.NEGATIVE_INFINITY;
   }
 
@@ -96,10 +165,14 @@ function scoreCandidate(candidate: RawActionCandidate): number {
     return Number.NEGATIVE_INFINITY;
   }
 
+  const kind = classifyCandidateKind(candidate);
   let score = 0;
+  if (kind === "register") score += 46;
+  if (kind === "auth") score += 36;
   if (submitControl) score += 60;
   if (candidate.inside_form) score += 30;
   if (candidate.same_origin && !candidate.same_page) score += 12;
+  if (!candidate.same_origin && candidate.same_site && !candidate.same_page) score += 9;
   if (candidate.path && candidate.path !== "/" && candidate.path !== "/home") score += 14;
   if (candidate.area === "header") score += 18;
   if (candidate.area === "main") score += 10;
@@ -108,6 +181,10 @@ function scoreCandidate(candidate: RawActionCandidate): number {
   if (text.length >= 3) score += 6;
   if (text.length > 60) score -= 4;
   return score;
+}
+
+function uniqueTexts(candidates: RankedActionCandidate[]): string[] {
+  return [...new Set(candidates.map((candidate) => candidate.text).filter(Boolean))];
 }
 
 export function buildScoutActionCandidates(rawCandidates: RawActionCandidate[]): {
@@ -134,10 +211,10 @@ export function buildScoutActionCandidates(rawCandidates: RawActionCandidate[]):
     ranked.push({ text, href, kind, score });
   }
 
-  ranked.sort((a, b) => b.score - a.score || a.text.localeCompare(b.text));
+  ranked.sort((a, b) => candidateKindPriority(b.kind) - candidateKindPriority(a.kind) || b.score - a.score || a.text.localeCompare(b.text));
 
-  const ctaCandidates = [...new Set(ranked.map((candidate) => candidate.text).filter(Boolean))].slice(0, 8);
-  const submitCandidates = [...new Set(ranked.filter((candidate) => candidate.kind === "submit").map((candidate) => candidate.text).filter(Boolean))].slice(0, 8);
+  const ctaCandidates = uniqueTexts(ranked).slice(0, 8);
+  const submitCandidates = uniqueTexts(ranked.filter((candidate) => candidate.kind === "submit")).slice(0, 8);
   const linkCandidates = ranked.filter((candidate) => candidate.kind !== "other").map(({ text, href, kind }) => ({ text, href, kind })).slice(0, 12);
 
   return {

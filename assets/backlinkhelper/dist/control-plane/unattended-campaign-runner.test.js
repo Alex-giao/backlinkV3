@@ -1,6 +1,9 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { runUnattendedCampaign } from "./unattended-campaign-runner.js";
+import { runOperatorCommand, runUnattendedCampaign } from "./unattended-campaign-runner.js";
 function makePromotedProfile() {
     return {
         url: "https://promo.example/",
@@ -72,6 +75,31 @@ function makeReadyPrepare(task) {
         },
     };
 }
+function makeStoppedPrepare(task) {
+    return {
+        mode: "task_stopped",
+        task: { ...task, status: "RETRYABLE" },
+        effective_target_url: task.target_url,
+        replay_hit: false,
+        scout_artifact_ref: `/tmp/${task.id}-scout.json`,
+        scout: {
+            ok: false,
+            surface_summary: "Target navigation failed and was moved to retryable cooldown.",
+            page_snapshot: {
+                url: task.target_url,
+                title: "Navigation failed",
+                body_text_excerpt: "Connection closed before the page could load.",
+            },
+            submit_candidates: [],
+            evidence_sufficiency: false,
+            auth_hints: [],
+            anti_bot_hints: [],
+            field_hints: [],
+            link_candidates: [],
+            embed_hints: [],
+        },
+    };
+}
 function makeEnvelope(task) {
     return {
         trace: {
@@ -109,6 +137,47 @@ function makeFinalizeResult() {
         terminal_class: "outcome_not_confirmed",
     };
 }
+function isProcessAlive(pid) {
+    try {
+        process.kill(pid, 0);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+test("operator command timeout terminates the whole child process group", async () => {
+    if (process.platform === "win32") {
+        return;
+    }
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "backlinkhelper-operator-timeout-"));
+    const childPidPath = path.join(tempDir, "child.pid");
+    const scriptPath = path.join(tempDir, "operator.mjs");
+    fs.writeFileSync(scriptPath, [
+        "import { spawn } from 'node:child_process';",
+        "import fs from 'node:fs';",
+        `const child = spawn(process.execPath, ['-e', 'process.on(\\"SIGTERM\\", () => {}); setInterval(() => {}, 1000);'], { stdio: 'ignore' });`,
+        `fs.writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));`,
+        "setInterval(() => {}, 1000);",
+    ].join("\n"));
+    const task = makeTask();
+    await assert.rejects(() => runOperatorCommand({
+        command: `${process.execPath} ${scriptPath}`,
+        context: {
+            task,
+            prepare: makeReadyPrepare(task),
+            scope: { promotedHostname: "promo.example", promotedUrl: "https://promo.example/" },
+            owner: "campaign-runner-test",
+            promotedUrl: "https://promo.example/",
+            promotedHostname: "promo.example",
+        },
+        timeoutMs: 100,
+        killGraceMs: 50,
+    }), /timed out/);
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    const childPid = Number(fs.readFileSync(childPidPath, "utf8"));
+    assert.equal(isProcessAlive(childPid), false);
+});
 test("runUnattendedCampaign loops intake enqueue -> claim -> prepare -> operator -> record -> finalize -> follow-up", async () => {
     const task = makeTask();
     const lease = makeLease(task.id);
@@ -185,6 +254,83 @@ test("runUnattendedCampaign loops intake enqueue -> claim -> prepare -> operator
     assert.equal(result.active_tasks_finalized, 1);
     assert.equal(result.follow_up_ticks, 1);
     assert.equal(result.events.at(-1)?.phase, "stop");
+});
+test("runUnattendedCampaign keeps pulling candidates after task-prepare stops a claimed task", async () => {
+    const stoppedTask = makeTask({
+        id: "campaign-0001-dead-target",
+        target_url: "https://dead.example/submit",
+        hostname: "dead.example",
+    });
+    const readyTask = makeTask({ id: "campaign-0002-good-target" });
+    const scopeResults = [
+        {
+            action: "claimed",
+            scope: { promotedHostname: "promo.example", promotedUrl: "https://promo.example/" },
+            detail: "Claimed dead scoped task.",
+            task: stoppedTask,
+            lease: makeLease(stoppedTask.id),
+        },
+        {
+            action: "claimed",
+            scope: { promotedHostname: "promo.example", promotedUrl: "https://promo.example/" },
+            detail: "Claimed next scoped task.",
+            task: readyTask,
+            lease: makeLease(readyTask.id),
+        },
+    ];
+    const calls = [];
+    const result = await runUnattendedCampaign({
+        owner: "campaign-runner-test",
+        promotedUrl: "https://promo.example/",
+        maxActiveTasks: 1,
+        maxScopeTicks: 3,
+    }, {
+        runScopeTick: async () => {
+            calls.push("scope");
+            const next = scopeResults.shift();
+            assert.ok(next, "expected one more scope tick result");
+            return next;
+        },
+        prepareTask: async (args) => {
+            calls.push(`prepare:${args.taskId}`);
+            return args.taskId === stoppedTask.id ? makeStoppedPrepare(stoppedTask) : makeReadyPrepare(readyTask);
+        },
+        runOperator: async (context) => {
+            calls.push(`operator:${context.task.id}`);
+            assert.equal(context.task.id, readyTask.id);
+            return makeEnvelope(readyTask);
+        },
+        recordAgentTrace: async (args) => {
+            calls.push(`record:${args.taskId}`);
+            return {
+                task_id: args.taskId,
+                trace_ref: `/tmp/${args.taskId}-agent-loop.json`,
+                pending_finalize_ref: `/tmp/${args.taskId}-pending-finalize.json`,
+            };
+        },
+        finalizeTask: async (args) => {
+            calls.push(`finalize:${args.taskId}`);
+            return makeFinalizeResult();
+        },
+        runFollowUpTick: async () => {
+            calls.push("follow-up");
+            return { mode: "idle" };
+        },
+    });
+    assert.deepEqual(calls, [
+        "scope",
+        `prepare:${stoppedTask.id}`,
+        "follow-up",
+        "scope",
+        `prepare:${readyTask.id}`,
+        `operator:${readyTask.id}`,
+        `record:${readyTask.id}`,
+        `finalize:${readyTask.id}`,
+    ]);
+    assert.equal(result.stop_reason, "max_active_tasks");
+    assert.equal(result.scope_ticks, 2);
+    assert.equal(result.active_tasks_started, 1);
+    assert.equal(result.active_tasks_finalized, 1);
 });
 test("runUnattendedCampaign refuses live active mutation when no operator is configured", async () => {
     let scopeTickCalled = false;

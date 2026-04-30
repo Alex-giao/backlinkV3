@@ -19,3 +19,9 @@ test("buildSystemPrompt falls back to saas_directory cues when family is unset",
   assert.match(prompt, /saas directory/i);
   assert.match(prompt, /submit your tool|submit startup/i);
 });
+
+test("buildSystemPrompt forbids registration credentials on cleartext HTTP pages", () => {
+  const prompt = buildSystemPrompt("forum_post");
+
+  assert.match(prompt, /never enter registration credentials on http:\/\/ pages or forms/i);
+});

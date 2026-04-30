@@ -9,6 +9,13 @@ function parsePayload(value) {
     }
     return JSON.parse(value);
 }
+function isCompleteTargetSitePayload(payload) {
+    return (typeof payload.target_url === "string" &&
+        typeof payload.hostname === "string" &&
+        typeof payload.source === "string" &&
+        typeof payload.submit_status === "string" &&
+        typeof payload.imported_at === "string");
+}
 function maybeNumber(value) {
     if (value === null || value === undefined) {
         return undefined;
@@ -164,7 +171,25 @@ export class SqlDataStore {
     }
     async listTargetSites(limit = 100) {
         await this.ensureDataDirectories();
-        const rows = await this.executor.all("SELECT payload_json FROM target_sites ORDER BY imported_at ASC, target_url ASC LIMIT ?", [limit]);
-        return rows.map((row) => parsePayload(row.payload_json));
+        const rows = await this.executor.all(`SELECT target_url, hostname, source, flow_family_hint, submit_status, imported_at, last_task_id, payload_json
+       FROM target_sites
+       ORDER BY imported_at ASC, target_url ASC
+       LIMIT ?`, [limit]);
+        return rows.map((row) => {
+            const payload = parsePayload(row.payload_json);
+            if (isCompleteTargetSitePayload(payload)) {
+                return payload;
+            }
+            return {
+                target_url: row.target_url,
+                hostname: row.hostname,
+                source: row.source,
+                flow_family_hint: row.flow_family_hint ?? undefined,
+                submit_status: row.submit_status,
+                imported_at: row.imported_at,
+                last_task_id: row.last_task_id ?? undefined,
+                payload,
+            };
+        });
     }
 }

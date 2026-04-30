@@ -65,6 +65,7 @@ export function __resetRuntimeRecoveryHookForTest(): void {
 type RetryDecisionBucket =
   | "terminal_success"
   | "external_email_verification"
+  | "external_captcha_solver"
   | "reactivation_cooldown"
   | "reactivate_ready"
   | "runtime_reactivate_ready"
@@ -140,6 +141,7 @@ const MANUAL_AUTH_REASON_CODES = new Set(["DIRECTORY_LOGIN_REQUIRED"]);
 const POLICY_REASON_CODES = new Set(["PAID_OR_SPONSORED_LISTING"]);
 const MISSING_INPUT_REASON_CODES = new Set(["REQUIRED_INPUT_MISSING"]);
 const EXTERNAL_EVENT_REASON_CODES = new Set(["EMAIL_VERIFICATION_PENDING"]);
+const CAPTCHA_SOLVER_REASON_CODES = new Set(["CAPTCHA_SOLVER_CONTINUATION"]);
 const TERMINAL_SUCCESS_REASON_CODES = new Set(["SITE_RESPONSE_PENDING"]);
 function semanticContractIncludes(
   flowFamily: TaskRecord["flow_family"] | undefined,
@@ -678,6 +680,22 @@ export function parkExhaustedRetryableTask(task: TaskRecord): boolean {
     return true;
   }
 
+  if (inferredReason && CAPTCHA_SOLVER_REASON_CODES.has(inferredReason)) {
+    updateTaskStatus(task, "WAITING_EXTERNAL_EVENT");
+    task.wait = {
+      wait_reason_code: "CAPTCHA_SOLVER_CONTINUATION",
+      resume_trigger: task.wait?.resume_trigger ?? exhaustedDetail,
+      resolution_owner: "system",
+      resolution_mode: "auto_resume",
+      evidence_ref: evidenceRef,
+    };
+    task.skip_reason_code = undefined;
+    task.terminal_class = "captcha_blocked";
+    task.last_takeover_outcome = task.wait.resume_trigger;
+    task.notes.push("Automatic retry exhaustion preserved CAPTCHA solver continuation as WAITING_EXTERNAL_EVENT instead of closing it as skipped.");
+    return true;
+  }
+
   if (inferredReason && MANUAL_AUTH_REASON_CODES.has(inferredReason)) {
     updateTaskStatus(task, "WAITING_MANUAL_AUTH");
     task.wait = {
@@ -1081,6 +1099,20 @@ export async function buildRetryDecisionPlan(
       resolutionOwner: "system",
       resolutionMode: "auto_resume",
       detail: "Strong visual confirmation without visible error is sufficient to treat the submission as accepted, even if the page implementation is client-side heavy.",
+    };
+  }
+
+  if (inferredReason && CAPTCHA_SOLVER_REASON_CODES.has(inferredReason)) {
+    return {
+      taskId: task.id,
+      hostname: task.hostname,
+      bucket: "external_captcha_solver",
+      nextStatus: "WAITING_EXTERNAL_EVENT",
+      waitReasonCode: "CAPTCHA_SOLVER_CONTINUATION",
+      resolutionOwner: "system",
+      resolutionMode: "auto_resume",
+      terminalClass: "captcha_blocked",
+      detail: "Task is blocked on a CAPTCHA / human-verification challenge that should stay in the external solver auto-resume lane instead of generic retry triage.",
     };
   }
 

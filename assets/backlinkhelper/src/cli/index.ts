@@ -1,5 +1,6 @@
 import { pathToFileURL } from "node:url";
 
+import type { FlowFamily } from "../shared/types.js";
 import { runClaimNextTaskCommand } from "./claim-next-task.js";
 import { runDbSmokeCommand } from "./db-smoke.js";
 import { runEnqueueSiteCommand } from "./enqueue-site.js";
@@ -105,8 +106,36 @@ export function buildUnknownCommandMessage(): string {
   return `Unknown command. Use ${SUPPORTED_COMMANDS.map((command) => `"${command}"`).join(", ").replace(/, ([^,]+)$/, ", or $1")}.`;
 }
 
+const SINGLE_TASK_OPERATOR_FORBIDDEN_COMMANDS = new Set<string>([
+  "enqueue-site",
+  "import-backlink-csv",
+  "follow-up-tick",
+  "unattended-campaign",
+  "unattended-scope-tick",
+  "update-promoted-dossier",
+  "claim-next-task",
+  "task-prepare",
+  "task-record-agent-trace",
+  "task-finalize",
+  "run-next",
+  "repartition-retry-decisions",
+]);
+
+export function assertCommandAllowedInSingleTaskOperatorMode(
+  command: string | undefined,
+  env: Record<string, string | undefined> = process.env,
+): void {
+  if (env.BACKLINKHELPER_SINGLE_TASK_OPERATOR_GUARD !== "1" || !command) {
+    return;
+  }
+  if (SINGLE_TASK_OPERATOR_FORBIDDEN_COMMANDS.has(command)) {
+    throw new Error(`Command ${command} is blocked by BACKLINKHELPER_SINGLE_TASK_OPERATOR_GUARD for single-task family operators.`);
+  }
+}
+
 async function main(): Promise<void> {
   const [, , command, ...rest] = process.argv;
+  assertCommandAllowedInSingleTaskOperatorMode(command);
   const cdpUrl = readFlag(rest, "--cdp-url");
 
   switch (command) {
@@ -128,7 +157,7 @@ async function main(): Promise<void> {
         promotedDescription: readFlag(rest, "--promoted-description"),
         submitterEmailBase: readFlag(rest, "--submitter-email-base"),
         confirmSubmit: readBooleanFlag(rest, "--confirm-submit"),
-        flowFamily: readFlag(rest, "--flow-family") as "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog" | undefined,
+        flowFamily: readFlag(rest, "--flow-family") as FlowFamily | undefined,
         enqueuedBy: readFlag(rest, "--enqueued-by"),
       });
       return;
@@ -142,7 +171,7 @@ async function main(): Promise<void> {
         source: readFlag(rest, "--source"),
         limit: readOptionalInt(rest, "--limit"),
         offset: readFlag(rest, "--offset") ? Number(readFlag(rest, "--offset")) : undefined,
-        flowFamily: readFlag(rest, "--flow-family") as "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog" | undefined,
+        flowFamily: readFlag(rest, "--flow-family") as FlowFamily | undefined,
         enqueue: readBooleanFlag(rest, "--enqueue"),
         promotedUrl: readFlag(rest, "--promoted-url"),
         promotedName: readFlag(rest, "--promoted-name"),
@@ -192,7 +221,7 @@ async function main(): Promise<void> {
         promotedDescription: readFlag(rest, "--promoted-description"),
         submitterEmailBase: readFlag(rest, "--submitter-email-base"),
         confirmSubmit: readBooleanFlag(rest, "--confirm-submit"),
-        flowFamily: readFlag(rest, "--flow-family") as "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog" | undefined,
+        flowFamily: readFlag(rest, "--flow-family") as FlowFamily | undefined,
         candidateLimit: readOptionalInt(rest, "--candidate-limit"),
         cdpUrl,
         dryRun: readBooleanFlag(rest, "--dry-run"),
@@ -217,7 +246,7 @@ async function main(): Promise<void> {
         promotedDescription: readFlag(rest, "--promoted-description"),
         submitterEmailBase: readFlag(rest, "--submitter-email-base"),
         confirmSubmit: readBooleanFlag(rest, "--confirm-submit"),
-        flowFamily: readFlag(rest, "--flow-family") as "saas_directory" | "forum_profile" | "wp_comment" | "dev_blog" | undefined,
+        flowFamily: readFlag(rest, "--flow-family") as FlowFamily | undefined,
         candidateLimit: readOptionalInt(rest, "--candidate-limit"),
         dryRun: readBooleanFlag(rest, "--dry-run"),
       });

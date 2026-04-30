@@ -376,6 +376,31 @@ test("parking an exhausted retryable task promotes captcha skips directly to SKI
   assert.equal(task.skip_reason_code, "captcha_or_human_verification_required");
 });
 
+test("parking an exhausted retryable task keeps CAPTCHA solver continuations waiting instead of closing them", () => {
+  const task = makeTask({
+    wait: {
+      wait_reason_code: "CAPTCHA_SOLVER_CONTINUATION",
+      resume_trigger: "CAPTCHA solver should continue from the current challenge state.",
+      resolution_owner: "system",
+      resolution_mode: "auto_resume",
+      evidence_ref: "artifact.json",
+    },
+    terminal_class: "captcha_blocked",
+    last_takeover_outcome: "Cloudflare human verification challenge detected.",
+  });
+
+  const parked = parkExhaustedRetryableTask(task);
+
+  assert.equal(parked, true);
+  assert.equal(task.status, "WAITING_EXTERNAL_EVENT");
+  assert.equal(task.wait?.wait_reason_code, "CAPTCHA_SOLVER_CONTINUATION");
+  assert.equal(task.wait?.resolution_owner, "system");
+  assert.equal(task.wait?.resolution_mode, "auto_resume");
+  assert.equal(task.terminal_class, "captcha_blocked");
+  assert.equal(task.skip_reason_code, undefined);
+  assert.equal(canRetry(task), false);
+});
+
 test("fresh retryable task remains eligible after backoff expires", () => {
   const task = makeTask({
     run_count: 1,
@@ -599,6 +624,46 @@ test("buildRetryDecisionPlan treats strong visual confirmation without failure s
   assert.equal(plan.bucket, "terminal_success");
   assert.equal(plan.nextStatus, "WAITING_SITE_RESPONSE");
   assert.equal(plan.waitReasonCode, "SITE_RESPONSE_PENDING");
+});
+
+test("buildRetryDecisionPlan preserves CAPTCHA solver continuations as external solver waits", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "bh-plan-"));
+  const artifactPath = path.join(dir, "finalization.json");
+  await writeFile(
+    artifactPath,
+    JSON.stringify({
+      current_url: "https://directory.example.com/submit",
+      title: "Human verification",
+      body_excerpt: "Cloudflare verifies that you are human before the form can continue.",
+      final_outcome: {
+        next_status: "WAITING_EXTERNAL_EVENT",
+        detail: "CAPTCHA solver should continue from the current challenge state.",
+        terminal_class: "captcha_blocked",
+        wait: {
+          wait_reason_code: "CAPTCHA_SOLVER_CONTINUATION",
+          resume_trigger: "CAPTCHA solver should continue from the current challenge state.",
+          resolution_owner: "system",
+          resolution_mode: "auto_resume",
+          evidence_ref: artifactPath,
+        },
+      },
+    }),
+    "utf-8",
+  );
+
+  const plan = await buildRetryDecisionPlan(
+    makeTask({
+      status: "WAITING_RETRY_DECISION",
+      latest_artifacts: [artifactPath],
+    }),
+  );
+
+  assert.equal(plan.bucket, "external_captcha_solver");
+  assert.equal(plan.nextStatus, "WAITING_EXTERNAL_EVENT");
+  assert.equal(plan.waitReasonCode, "CAPTCHA_SOLVER_CONTINUATION");
+  assert.equal(plan.resolutionOwner, "system");
+  assert.equal(plan.resolutionMode, "auto_resume");
+  assert.equal(plan.terminalClass, "captcha_blocked");
 });
 
 test("buildRetryDecisionPlan does not apply directory success phrases to forum_profile tasks", async () => {

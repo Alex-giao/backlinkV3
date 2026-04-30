@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { enqueueSiteTask } from "../control-plane/task-queue.js";
-import { classifyTargetFlowFamily } from "../families/classifier.js";
+import { classifyTargetSurfaceForIntake } from "../families/classifier.js";
 import { ensureDataDirectories, hostnameToKey, upsertTargetSite } from "../memory/data-store.js";
 function parseCsvLine(line) {
     const values = [];
@@ -61,10 +61,19 @@ function buildTaskId(args) {
     return `${args.prefix}-${String(args.index).padStart(4, "0")}-${hostname}`.slice(0, 120);
 }
 export function classifyImportedTargetFlowFamily(args) {
-    return classifyTargetFlowFamily({
+    return classifyTargetSurfaceForIntake({
         targetUrl: args.targetUrl,
         requestedFlowFamily: args.requestedFlowFamily,
     });
+}
+function targetSiteFlowFamilyHintForImport(classification) {
+    // `flow_family_hint` means explicit/operator-provided routing evidence for
+    // future intake. Do not persist auto-inferred families as hints, otherwise a
+    // later unattended tick will treat the row as explicit and lose provenance.
+    if (classification.source === "inferred" || classification.state === "needs_classification") {
+        return undefined;
+    }
+    return classification.flowFamily;
 }
 export async function runImportBacklinkCsvCommand(args) {
     await ensureDataDirectories();
@@ -98,11 +107,15 @@ export async function runImportBacklinkCsvCommand(args) {
         const taskId = args.enqueue && args.promotedUrl
             ? buildTaskId({ prefix: args.taskIdPrefix ?? "csv-import", index: offset + index + 1, targetUrl })
             : undefined;
-        let lastTaskId = taskId;
-        let submitStatus = taskId ? "enqueued" : "candidate";
+        let lastTaskId;
+        let submitStatus = flowFamilyClassification.state === "needs_classification"
+            ? "needs_classification"
+            : taskId
+                ? "enqueued"
+                : "candidate";
         let enqueueOutcome;
         let enqueueError;
-        if (taskId && args.promotedUrl) {
+        if (taskId && args.promotedUrl && flowFamilyClassification.state === "ready") {
             try {
                 const result = await enqueueSiteTask({
                     taskId,
@@ -112,7 +125,7 @@ export async function runImportBacklinkCsvCommand(args) {
                     promotedDescription: args.promotedDescription,
                     submitterEmailBase: args.submitterEmailBase,
                     confirmSubmit: false,
-                    flowFamily: args.flowFamily,
+                    flowFamily: flowFamilyClassification.source === "inferred" ? undefined : args.flowFamily,
                     enqueuedBy: "import-backlink-csv",
                 });
                 enqueueOutcome = result.outcome;
@@ -139,7 +152,7 @@ export async function runImportBacklinkCsvCommand(args) {
             target_url: targetUrl,
             hostname,
             source: args.source ?? "csv-import",
-            flow_family_hint: flowFamilyClassification.flowFamily,
+            flow_family_hint: targetSiteFlowFamilyHintForImport(flowFamilyClassification),
             submit_status: submitStatus,
             imported_at: new Date().toISOString(),
             last_task_id: lastTaskId,

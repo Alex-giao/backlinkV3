@@ -16,6 +16,7 @@ const cwd = '/home/gc/backlinkV3/assets/backlinkhelper';
 const env = { ...process.env, BACKLINKHELPER_STORE: 'd1', BACKLINKHELPER_D1_DATABASE_NAME: 'backlinkhelper-v3' };
 const runtimeDir = '/home/gc/.hermes/state/backlinkhelper-v3/runtime';
 fs.mkdirSync(runtimeDir, { recursive: true });
+const workerName = process.env.BACKLINKHELPER_WATCHDOG_NAME || 'promoted-site-unattended-loop';
 const cdp = process.env.BACKLINKHELPER_CDP_URL || 'http://127.0.0.1:9224';
 const promotedUrl = process.env.BACKLINKHELPER_PROMOTED_URL || 'https://suikagame.fun/';
 const promotedHostname = new URL(promotedUrl).hostname.replace(/^www\./i, '').toLowerCase();
@@ -83,6 +84,54 @@ function compactStatusFromOutput(text) {
 function submittedSuccessFromStatus(status) {
   return Number(status?.business?.submitted_success ?? NaN);
 }
+function isRegularCdpPageTarget(target) {
+  if (target?.type !== 'page') return false;
+  const url = target.url || '';
+  return url.startsWith('http://') || url.startsWith('https://') || url.startsWith('file://');
+}
+async function fetchJson(url, timeoutMs = 5000) {
+  const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+  return response.json();
+}
+async function cleanupSharedBrowserTabsIfIdle(statusPayload) {
+  const leases = statusPayload?.worker_leases || {};
+  if (Object.keys(leases).length > 0) {
+    return { skipped: true, reason: 'worker_leases_present', leases: Object.keys(leases) };
+  }
+  const pending = pendingFiles();
+  if (pending.length > 0) {
+    return { skipped: true, reason: 'pending_finalize_present', pending_count: pending.length };
+  }
+  const targets = await fetchJson(new URL('/json/list', cdp));
+  const regularTargets = targets.filter(isRegularCdpPageTarget);
+  const closed = [];
+  const failed = [];
+  for (const target of regularTargets) {
+    if (!target.id) continue;
+    try {
+      const response = await fetch(new URL(`/json/close/${encodeURIComponent(target.id)}`, cdp), {
+        signal: AbortSignal.timeout(5000),
+      });
+      if (response.ok) {
+        closed.push({ id: target.id, url: target.url, title: target.title });
+      } else {
+        failed.push({ id: target.id, url: target.url, status: response.status });
+      }
+    } catch (error) {
+      failed.push({ id: target.id, url: target.url, error: error.message });
+    }
+  }
+  return {
+    skipped: false,
+    inspected: targets.length,
+    regular_targets: regularTargets.length,
+    closed_count: closed.length,
+    failed_count: failed.length,
+    closed,
+    failed,
+  };
+}
 
 async function main() {
   const lockResult = workerLockEnabled
@@ -90,13 +139,13 @@ async function main() {
         lockDir: workerLockDir,
         ownerId: workerOwnerId,
         staleMs: workerLockStaleMs,
-        metadata: { pid: process.pid, promoted_hostname: promotedHostname, mode: 'suika-unattended-loop' },
+        metadata: { pid: process.pid, promoted_hostname: promotedHostname, mode: workerName },
       })
     : { acquired: true, recovered_stale: false, lock: undefined };
 
   if (!lockResult.acquired) {
     console.log(JSON.stringify({
-      worker: 'suika-unattended-loop',
+      worker: workerName,
       promoted_url: promotedUrl,
       promoted_hostname: promotedHostname,
       status: 'already_running',
@@ -144,7 +193,7 @@ async function main() {
         '--candidate-limit', process.env.BACKLINKHELPER_CANDIDATE_LIMIT || '500',
         '--no-follow-up',
         '--cdp-url', cdp,
-        '--operator-command', 'node scripts/suika-blogger-operator.mjs',
+        '--operator-command', 'node scripts/family-aware-operator-dispatcher.mjs',
         '--operator-timeout-ms', String(operatorTimeoutMs),
       ], { timeout: campaignTimeoutMs });
       const campaignResult = campaign.ok ? parseJsonObject(campaign.out) : undefined;
@@ -154,6 +203,10 @@ async function main() {
       const finalized = await finalizePending();
       const status = runCli(['guarded-drain-status', '--promoted-hostname', promotedHostname], { timeout: 180000 });
       const compactStatus = compactStatusFromOutput(status.out);
+      const statusPayload = parseJsonObject(status.out);
+      const tabCleanup = statusPayload
+        ? await cleanupSharedBrowserTabsIfIdle(statusPayload).catch(error => ({ skipped: true, reason: 'cleanup_error', error: error.message }))
+        : { skipped: true, reason: 'status_not_json' };
       const nextSubmittedSuccess = submittedSuccessFromStatus(compactStatus);
       if (Number.isFinite(nextSubmittedSuccess)) {
         submittedSuccess = nextSubmittedSuccess;
@@ -168,6 +221,7 @@ async function main() {
         campaign_tail: (campaign.out || campaign.err || '').slice(-1200),
         beforePending,
         finalized,
+        tabCleanup,
         idleCount,
         status: compactStatus,
       });
@@ -207,7 +261,7 @@ async function main() {
   const status = runCli(['guarded-drain-status', '--promoted-hostname', promotedHostname], { timeout: 180000 });
   const compactStatus = compactStatusFromOutput(status.out);
   console.log(JSON.stringify({
-    worker: 'suika-unattended-loop',
+    worker: workerName,
     promoted_url: promotedUrl,
     promoted_hostname: promotedHostname,
     lock: workerLockEnabled ? { acquired: true, recovered_stale: lockResult.recovered_stale, lock_dir: workerLockDir } : { enabled: false },

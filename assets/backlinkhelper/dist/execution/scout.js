@@ -4,6 +4,7 @@ import { getFamilyConfig } from "../families/index.js";
 import { DATA_DIRECTORIES } from "../memory/data-store.js";
 import { inferPageAssessment } from "../shared/page-assessment.js";
 import { PlaywrightSessionTimeoutError, withConnectedPage } from "../shared/playwright-session.js";
+import { safeSameSiteSiblingNavigation } from "./site-scope.js";
 function extractHints(text, familyConfig) {
     const normalized = text.toLowerCase();
     const field_hints = familyConfig.scout.fieldHints.filter((hint) => normalized.includes(hint));
@@ -57,6 +58,7 @@ async function collectVisibleSurfaceText(root) {
         .catch(() => "");
 }
 async function collectActionCandidates(root) {
+    const currentUrl = root.url();
     const rawCandidates = await root
         .locator('a[href], button, [role="button"], input[type="submit"], input[type="button"]')
         .evaluateAll((elements) => {
@@ -81,7 +83,7 @@ async function collectActionCandidates(root) {
                 try {
                     const resolved = new URL(href, location.href);
                     sameOrigin = resolved.origin === location.origin;
-                    samePage = resolved.pathname === location.pathname && resolved.search === location.search;
+                    samePage = sameOrigin && resolved.pathname === location.pathname && resolved.search === location.search;
                     path = resolved.pathname;
                 }
                 catch {
@@ -109,7 +111,12 @@ async function collectActionCandidates(root) {
         return rows;
     })
         .catch(() => []);
-    return buildScoutActionCandidates(rawCandidates);
+    return buildScoutActionCandidates(rawCandidates.map((candidate) => ({
+        ...candidate,
+        same_site: candidate.href
+            ? safeSameSiteSiblingNavigation({ currentUrl, candidateUrl: candidate.href })
+            : false,
+    })));
 }
 function inferEmbedProvider(args) {
     const combined = `${args.frameUrl}\n${args.frameTitle ?? ""}\n${args.bodyText}`.toLowerCase();
@@ -138,6 +145,82 @@ function inferEmbedProvider(args) {
         return "recaptcha";
     }
     return "unknown";
+}
+const TRACKING_QUERY_PREFIXES = ["utm_"];
+const TRACKING_QUERY_KEYS = new Set(["ref", "fbclid", "gclid", "mc_cid", "mc_eid"]);
+function uniquePush(values, candidate) {
+    if (!values.includes(candidate)) {
+        values.push(candidate);
+    }
+}
+function stripTrackingQuery(rawUrl) {
+    try {
+        const url = new URL(rawUrl);
+        let changed = false;
+        for (const key of [...url.searchParams.keys()]) {
+            const normalized = key.toLowerCase();
+            if (TRACKING_QUERY_KEYS.has(normalized) || TRACKING_QUERY_PREFIXES.some((prefix) => normalized.startsWith(prefix))) {
+                url.searchParams.delete(key);
+                changed = true;
+            }
+        }
+        return changed ? url.href : undefined;
+    }
+    catch {
+        return undefined;
+    }
+}
+function withoutHash(rawUrl) {
+    try {
+        const url = new URL(rawUrl);
+        if (!url.hash)
+            return undefined;
+        url.hash = "";
+        return url.href;
+    }
+    catch {
+        return undefined;
+    }
+}
+function withHttps(rawUrl) {
+    try {
+        const url = new URL(rawUrl);
+        if (url.protocol !== "http:")
+            return undefined;
+        url.protocol = "https:";
+        return url.href;
+    }
+    catch {
+        return undefined;
+    }
+}
+export function generateScoutNavigationCandidates(targetUrl) {
+    const candidates = [];
+    uniquePush(candidates, targetUrl);
+    const directHttps = withHttps(targetUrl);
+    if (directHttps)
+        uniquePush(candidates, directHttps);
+    const strippedTracking = stripTrackingQuery(targetUrl);
+    if (strippedTracking) {
+        uniquePush(candidates, strippedTracking);
+        const strippedHttps = withHttps(strippedTracking);
+        if (strippedHttps)
+            uniquePush(candidates, strippedHttps);
+    }
+    for (const candidate of [...candidates]) {
+        try {
+            const parsed = new URL(candidate);
+            if (parsed.search)
+                continue;
+        }
+        catch {
+            continue;
+        }
+        const noHash = withoutHash(candidate);
+        if (noHash)
+            uniquePush(candidates, noHash);
+    }
+    return candidates;
 }
 function normalizeFrameUrl(src, pageUrl) {
     if (!src) {
@@ -213,91 +296,100 @@ export async function runLightweightScout(args) {
     const familyConfig = getFamilyConfig(args.task.flow_family);
     try {
         return await withConnectedPage(args.runtime.cdp_url, async (page) => {
-            try {
-                const response = await page.goto(args.task.target_url, {
-                    waitUntil: "domcontentloaded",
-                    timeout: 20_000,
-                });
-                await page.waitForTimeout(1_500).catch(() => undefined);
-                const bodyTextExcerpt = await page.locator("body").innerText().catch(() => "");
-                const pageScreenshotRef = path.join(DATA_DIRECTORIES.artifacts, `${args.task.id}-scout-page.png`);
-                await page.screenshot({ path: pageScreenshotRef, fullPage: true }).catch(() => undefined);
-                const snapshot = {
-                    url: page.url(),
-                    title: await page.title(),
-                    response_status: response?.status(),
-                    body_text_excerpt: bodyTextExcerpt.slice(0, 3_000),
-                    screenshot_ref: pageScreenshotRef,
-                };
-                const actionCandidates = await collectActionCandidates(page);
-                const embedHints = await collectEmbedHints({ page, task: args.task, familyConfig });
-                const embedCombinedText = embedHints
-                    .map((hint) => `${hint.provider}\n${hint.frame_url}\n${hint.body_text_excerpt}\n${hint.cta_candidates.join("\n")}`)
-                    .join("\n\n");
-                const visibleSurfaceText = await collectVisibleSurfaceText(page);
-                const combinedStructuredText = `${visibleSurfaceText}\n${embedCombinedText}`;
-                const hints = extractHints(combinedStructuredText, familyConfig);
-                const visualProbeRecommended = actionCandidates.submitCandidates.length === 0 && embedHints.some((hint) => hint.likely_interactive);
-                const evidenceSufficiency = hints.evidence_sufficiency || visualProbeRecommended || actionCandidates.linkCandidates.length > 0;
-                const topInteractiveEmbed = embedHints.find((hint) => hint.likely_interactive);
-                const surfaceSummary = snapshot.response_status && snapshot.response_status >= 500
-                    ? `Scout reached ${snapshot.url} but the directory returned upstream status ${snapshot.response_status}.`
-                    : visualProbeRecommended && topInteractiveEmbed
-                        ? `Scout reached ${snapshot.url} with title "${snapshot.title}" and detected a likely interactive ${topInteractiveEmbed.provider} embed in frame ${topInteractiveEmbed.frame_index}.`
-                        : `Scout reached ${snapshot.url} with title "${snapshot.title}".`;
-                const pageAssessment = inferPageAssessment({
-                    url: snapshot.url,
-                    title: snapshot.title,
-                    bodyText: snapshot.body_text_excerpt,
-                    responseStatus: snapshot.response_status,
-                    submitCandidates: actionCandidates.submitCandidates,
-                    fieldHints: hints.field_hints,
-                    authHints: hints.auth_hints,
-                    antiBotHints: hints.anti_bot_hints,
-                    embedHintsCount: embedHints.length,
-                    visualProbeRecommended,
-                    flowFamily: args.task.flow_family,
-                });
-                return {
-                    ok: true,
-                    surface_summary: surfaceSummary,
-                    submit_candidates: actionCandidates.submitCandidates,
-                    page_snapshot: snapshot,
-                    embed_hints: embedHints,
-                    link_candidates: actionCandidates.linkCandidates,
-                    visual_probe_recommended: visualProbeRecommended,
-                    page_assessment: pageAssessment,
-                    ...hints,
-                    evidence_sufficiency: evidenceSufficiency,
-                };
-            }
-            catch (error) {
-                const message = error instanceof Error ? error.message : "Unknown navigation failure.";
-                return {
-                    ok: false,
-                    surface_summary: `Scout could not load ${args.task.target_url}: ${message}`,
-                    submit_candidates: [],
-                    link_candidates: [],
-                    page_snapshot: {
-                        url: args.task.target_url,
-                        title: "Navigation failed",
-                        body_text_excerpt: message,
-                    },
-                    embed_hints: [],
-                    visual_probe_recommended: false,
-                    page_assessment: inferPageAssessment({
-                        url: args.task.target_url,
-                        title: "Navigation failed",
-                        bodyText: message,
-                        navigationFailed: true,
+            const navigationCandidates = generateScoutNavigationCandidates(args.task.target_url);
+            const navigationFailures = [];
+            for (const candidateUrl of navigationCandidates) {
+                try {
+                    const response = await page.goto(candidateUrl, {
+                        waitUntil: "domcontentloaded",
+                        timeout: 20_000,
+                    });
+                    await page.waitForTimeout(1_500).catch(() => undefined);
+                    const bodyTextExcerpt = await page.locator("body").innerText().catch(() => "");
+                    const pageScreenshotRef = path.join(DATA_DIRECTORIES.artifacts, `${args.task.id}-scout-page.png`);
+                    await page.screenshot({ path: pageScreenshotRef, fullPage: true }).catch(() => undefined);
+                    const snapshot = {
+                        url: page.url(),
+                        title: await page.title(),
+                        response_status: response?.status(),
+                        body_text_excerpt: bodyTextExcerpt.slice(0, 3_000),
+                        screenshot_ref: pageScreenshotRef,
+                    };
+                    const actionCandidates = await collectActionCandidates(page);
+                    const embedHints = await collectEmbedHints({ page, task: args.task, familyConfig });
+                    const embedCombinedText = embedHints
+                        .map((hint) => `${hint.provider}\n${hint.frame_url}\n${hint.body_text_excerpt}\n${hint.cta_candidates.join("\n")}`)
+                        .join("\n\n");
+                    const visibleSurfaceText = await collectVisibleSurfaceText(page);
+                    const combinedStructuredText = `${visibleSurfaceText}\n${embedCombinedText}`;
+                    const hints = extractHints(combinedStructuredText, familyConfig);
+                    const visualProbeRecommended = actionCandidates.submitCandidates.length === 0 && embedHints.some((hint) => hint.likely_interactive);
+                    const evidenceSufficiency = hints.evidence_sufficiency || visualProbeRecommended || actionCandidates.linkCandidates.length > 0;
+                    const topInteractiveEmbed = embedHints.find((hint) => hint.likely_interactive);
+                    const recoveredPrefix = candidateUrl !== args.task.target_url
+                        ? `Scout recovered from ${args.task.target_url} by loading canonical candidate ${candidateUrl}. `
+                        : "";
+                    const surfaceSummary = snapshot.response_status && snapshot.response_status >= 500
+                        ? `${recoveredPrefix}Scout reached ${snapshot.url} but the directory returned upstream status ${snapshot.response_status}.`
+                        : visualProbeRecommended && topInteractiveEmbed
+                            ? `${recoveredPrefix}Scout reached ${snapshot.url} with title "${snapshot.title}" and detected a likely interactive ${topInteractiveEmbed.provider} embed in frame ${topInteractiveEmbed.frame_index}.`
+                            : `${recoveredPrefix}Scout reached ${snapshot.url} with title "${snapshot.title}".`;
+                    const pageAssessment = inferPageAssessment({
+                        url: snapshot.url,
+                        title: snapshot.title,
+                        bodyText: snapshot.body_text_excerpt,
+                        responseStatus: snapshot.response_status,
+                        submitCandidates: actionCandidates.submitCandidates,
+                        fieldHints: hints.field_hints,
+                        authHints: hints.auth_hints,
+                        antiBotHints: hints.anti_bot_hints,
+                        embedHintsCount: embedHints.length,
+                        visualProbeRecommended,
                         flowFamily: args.task.flow_family,
-                    }),
-                    field_hints: [],
-                    auth_hints: [],
-                    anti_bot_hints: [],
-                    evidence_sufficiency: false,
-                };
+                    });
+                    return {
+                        ok: true,
+                        surface_summary: surfaceSummary,
+                        submit_candidates: actionCandidates.submitCandidates,
+                        page_snapshot: snapshot,
+                        embed_hints: embedHints,
+                        link_candidates: actionCandidates.linkCandidates,
+                        visual_probe_recommended: visualProbeRecommended,
+                        page_assessment: pageAssessment,
+                        ...hints,
+                        evidence_sufficiency: evidenceSufficiency,
+                    };
+                }
+                catch (error) {
+                    const message = error instanceof Error ? error.message : "Unknown navigation failure.";
+                    navigationFailures.push(`${candidateUrl}: ${message}`);
+                }
             }
+            const message = navigationFailures.join("\n---\n") || "Unknown navigation failure.";
+            return {
+                ok: false,
+                surface_summary: `Scout could not load ${args.task.target_url} after ${navigationCandidates.length} canonical navigation candidate(s): ${message}`,
+                submit_candidates: [],
+                link_candidates: [],
+                page_snapshot: {
+                    url: args.task.target_url,
+                    title: "Navigation failed",
+                    body_text_excerpt: message,
+                },
+                embed_hints: [],
+                visual_probe_recommended: false,
+                page_assessment: inferPageAssessment({
+                    url: args.task.target_url,
+                    title: "Navigation failed",
+                    bodyText: message,
+                    navigationFailed: true,
+                    flowFamily: args.task.flow_family,
+                }),
+                field_hints: [],
+                auth_hints: [],
+                anti_bot_hints: [],
+                evidence_sufficiency: false,
+            };
         }, {
             freshPage: true,
             operationTimeoutMs: 45_000,

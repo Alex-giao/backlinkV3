@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { UNATTENDED_POLICY, applyFamilySpecificOutcomeGuard, applySignupContinuationGuard, applyVisualVerificationGuard, buildBrowserUseSessionName, choosePreferredFinalizationPageStateSample, classifyEarlyTerminalOutcome, hasCredibleSignupContinuation, mustRunVisualGateBeforeClosure, runAgentDrivenBrowserUseLoop, shouldAttemptVisionRecovery, shouldRunVisualFallback, validateFinalizationPageContext, } from "./takeover.js";
+import { UNATTENDED_POLICY, applyFamilySpecificOutcomeGuard, applySignupContinuationGuard, applyVisualVerificationGuard, buildBrowserUseSessionName, chooseFinalOutcome, choosePreferredFinalizationPageStateSample, resolveFinalizationPreferredUrl, shouldRebindFinalizationPageContext, classifyEarlyTerminalOutcome, hasCredibleSignupContinuation, mustRunVisualGateBeforeClosure, runAgentDrivenBrowserUseLoop, shouldAttemptVisionRecovery, shouldRunVisualFallback, validateFinalizationPageContext, } from "./takeover.js";
 function baseRetryableOutcome() {
     return {
         next_status: "RETRYABLE",
@@ -17,6 +17,51 @@ test("repo-native agent loop is disabled in operator-only mode", async () => {
         task: {},
         scout: {},
     }), /operator-only mode/i);
+});
+test("final outcome selection accepts legacy proposed_outcome.status alias without producing a null next_status", () => {
+    const outcome = chooseFinalOutcome({
+        inferred: baseRetryableOutcome(),
+        proposed: {
+            status: "SKIPPED",
+            detail: "Target is not a SaaS directory submission surface.",
+            terminal_class: "outcome_not_confirmed",
+            skip_reason_code: "not_saas_directory_surface",
+        },
+    });
+    assert.equal(outcome.next_status, "SKIPPED");
+    assert.equal(outcome.detail, "Target is not a SaaS directory submission surface.");
+    assert.equal(outcome.skip_reason_code, "not_saas_directory_surface");
+});
+test("final outcome selection falls back to inferred outcome when proposed_outcome has no usable status", () => {
+    const inferred = baseRetryableOutcome();
+    const outcome = chooseFinalOutcome({
+        inferred,
+        proposed: {
+            detail: "Malformed operator outcome.",
+        },
+    });
+    assert.equal(outcome, inferred);
+    assert.equal(outcome.next_status, "RETRYABLE");
+});
+test("final outcome selection ignores forum/comment policy blockers based only on content relevance", () => {
+    const inferred = baseRetryableOutcome();
+    const outcome = chooseFinalOutcome({
+        inferred,
+        flowFamily: "forum_post",
+        proposed: {
+            next_status: "WAITING_POLICY_DECISION",
+            detail: "The target thread is topically different and low content relevance, so this would be off-topic.",
+            wait: {
+                wait_reason_code: "FORUM_POST_ANTI_SPAM_BLOCKED",
+                resolution_owner: "system",
+                resolution_mode: "terminal_audit",
+                resume_trigger: "Review off-topic content relevance before posting.",
+                evidence_ref: "artifact.json",
+            },
+        },
+    });
+    assert.equal(outcome, inferred);
+    assert.equal(outcome.next_status, "RETRYABLE");
 });
 test("visual guard blocks manual-auth when screenshot looks like register gate", () => {
     const guarded = applyVisualVerificationGuard({
@@ -50,7 +95,27 @@ test("visual guard upgrades retryable outcome to waiting-site-response on confir
     assert.equal(guarded.next_status, "WAITING_SITE_RESPONSE");
     assert.equal(guarded.wait?.wait_reason_code, "SITE_RESPONSE_PENDING");
 });
-test("visual guard upgrades retryable outcome to captcha skip when screenshot shows human verification", () => {
+test("final outcome selection ignores forum/comment policy blockers based on promotional-post rules", () => {
+    const inferred = baseRetryableOutcome();
+    const outcome = chooseFinalOutcome({
+        inferred,
+        flowFamily: "forum_post",
+        proposed: {
+            next_status: "WAITING_POLICY_DECISION",
+            detail: "Forum rules prohibit advertising, promotional links, and commercial backlinks.",
+            wait: {
+                wait_reason_code: "FORUM_POLICY_PROMOTIONAL_LINKS",
+                resolution_owner: "system",
+                resolution_mode: "terminal_audit",
+                resume_trigger: "Review forum advertising policy before posting.",
+                evidence_ref: "artifact.json",
+            },
+        },
+    });
+    assert.equal(outcome, inferred);
+    assert.equal(outcome.next_status, "RETRYABLE");
+});
+test("visual guard parks CAPTCHA/human verification in solver wait lane instead of retrying or skipping", () => {
     const guarded = applyVisualVerificationGuard({
         outcome: baseRetryableOutcome(),
         visualVerification: {
@@ -61,8 +126,11 @@ test("visual guard upgrades retryable outcome to captcha skip when screenshot sh
         },
         evidenceRef: "artifact.json",
     });
-    assert.equal(guarded.next_status, "SKIPPED");
+    assert.equal(guarded.next_status, "WAITING_EXTERNAL_EVENT");
     assert.equal(guarded.terminal_class, "captcha_blocked");
+    assert.equal(guarded.wait?.wait_reason_code, "CAPTCHA_SOLVER_CONTINUATION");
+    assert.equal(guarded.wait?.resolution_mode, "auto_resume");
+    assert.equal(guarded.skip_reason_code, undefined);
 });
 test("visual guard upgrades retryable outcome to manual auth on clear login wall", () => {
     const guarded = applyVisualVerificationGuard({
@@ -108,6 +176,19 @@ test("low-confidence visual signal does not override current outcome", () => {
         evidenceRef: "artifact.json",
     });
     assert.equal(guarded.next_status, "RETRYABLE");
+});
+test("malformed visual signal without numeric confidence does not crash finalization", () => {
+    assert.doesNotThrow(() => {
+        const guarded = applyVisualVerificationGuard({
+            outcome: baseRetryableOutcome(),
+            visualVerification: {
+                classification: "success_or_confirmation",
+                summary: "Agent supplied an incomplete visual payload.",
+            },
+            evidenceRef: "artifact.json",
+        });
+        assert.equal(guarded.next_status, "RETRYABLE");
+    });
 });
 test("reachable non-success page defaults to visual fallback even when visual flag is false", () => {
     assert.equal(shouldRunVisualFallback({
@@ -302,6 +383,34 @@ test("finalization page context accepts canonical same-host pages after www norm
     assert.equal(validation.expected_hostname, "designnominees.com");
     assert.equal(validation.actual_hostname, "designnominees.com");
 });
+test("finalization reconnect prefers the handoff page over unrelated shared-CDP tabs", () => {
+    assert.equal(resolveFinalizationPreferredUrl({
+        taskTargetUrl: "https://directory.example.com/submit",
+        handoffCurrentUrl: "https://directory.example.com/submit/thank-you",
+    }), "https://directory.example.com/submit/thank-you");
+    assert.equal(resolveFinalizationPreferredUrl({
+        taskTargetUrl: "https://directory.example.com/submit",
+        handoffCurrentUrl: "",
+    }), "https://directory.example.com/submit");
+});
+test("finalization reconnect falls back to task URL when handoff is a Chrome internal error page", () => {
+    assert.equal(resolveFinalizationPreferredUrl({
+        taskTargetUrl: "https://webkit.dti.ne.jp/bbs/thread.do?id=1676856",
+        handoffCurrentUrl: "chrome-error://chromewebdata/",
+    }), "https://webkit.dti.ne.jp/bbs/thread.do?id=1676856");
+});
+test("finalization reconnect rebinds stale shared-CDP Chrome error tabs to the task-bound URL", () => {
+    assert.equal(shouldRebindFinalizationPageContext({
+        currentUrl: "chrome-error://chromewebdata/",
+        preferredUrl: "https://webkit.dti.ne.jp/bbs/thread.do?id=1676856",
+        taskHostname: "webkit.dti.ne.jp",
+    }), true);
+    assert.equal(shouldRebindFinalizationPageContext({
+        currentUrl: "https://webkit.dti.ne.jp/bbs/thread.do?id=1676856",
+        preferredUrl: "https://webkit.dti.ne.jp/bbs/thread.do?id=1676856",
+        taskHostname: "webkit.dti.ne.jp",
+    }), false);
+});
 test("signup continuation guard keeps mixed login/signup surface retryable", () => {
     const guarded = applySignupContinuationGuard({
         outcome: {
@@ -405,6 +514,31 @@ test("browser-use session names are unique per run and stay bounded", () => {
     assert.notEqual(left, right);
     assert.ok(left.length <= 64);
     assert.match(left, /^task-/);
+});
+test("early terminal classifier does not treat visible Google OAuth as manual auth", () => {
+    const classified = classifyEarlyTerminalOutcome({
+        currentUrl: "https://directory.example.com/sign-in",
+        title: "Sign in",
+        bodyText: "Welcome back. Log in with Google to continue submitting your tool.",
+        evidenceRef: "artifact.json",
+    });
+    assert.notEqual(classified.outcome.next_status, "WAITING_MANUAL_AUTH");
+    assert.notEqual(classified.outcome.wait?.wait_reason_code, "DIRECTORY_LOGIN_REQUIRED");
+    assert.equal(classified.allow_rerun, true);
+});
+test("early terminal classifier keeps CAPTCHA in auto-resume solver lane when bypass is allowed", () => {
+    const classified = classifyEarlyTerminalOutcome({
+        currentUrl: "https://directory.example.com/submit",
+        title: "Human verification",
+        bodyText: "Please verify you are human. I'm not a robot CAPTCHA challenge.",
+        evidenceRef: "artifact.json",
+    });
+    assert.equal(classified.hypothesis, "captcha_blocked");
+    assert.equal(classified.allow_rerun, true);
+    assert.equal(classified.outcome.next_status, "WAITING_EXTERNAL_EVENT");
+    assert.equal(classified.outcome.terminal_class, "captcha_blocked");
+    assert.equal(classified.outcome.wait?.wait_reason_code, "CAPTCHA_SOLVER_CONTINUATION");
+    assert.equal(classified.outcome.wait?.resolution_mode, "auto_resume");
 });
 test("early terminal classifier promotes clear required-field blockers to WAITING_MISSING_INPUT", () => {
     const classified = classifyEarlyTerminalOutcome({
